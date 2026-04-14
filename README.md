@@ -133,8 +133,8 @@ CLAWDBOT_NOTIFY_TARGET="YOUR_CHAT_ID"
 
 # Agent defaults
 CLAWDBOT_DEFAULT_AGENT="codex"
-CLAWDBOT_CODEX_MODEL="gpt-5.3-codex"
-CLAWDBOT_CLAUDE_MODEL="claude-sonnet-4-6"
+CLAWDBOT_CODEX_MODEL="gpt-5.4"
+CLAWDBOT_CLAUDE_MODEL="claude-opus-4-6"
 CLAWDBOT_GEMINI_MODEL="gemini-2.5-pro"
 
 # Optional
@@ -201,7 +201,7 @@ Example:
   ~/Projects/my-backend \
   fix/auth-bug \
   codex \
-  gpt-5.3-codex \
+  gpt-5.4 \
   xhigh \
   "Fix the auth refresh token race condition. Add tests. Open a PR against development."
 ```
