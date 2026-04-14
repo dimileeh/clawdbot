@@ -86,6 +86,27 @@ cp .env.example .env
 # Edit .env with your repos, GitHub owner, paths, etc.
 ```
 
+### API Keys
+
+Coding agents need their provider's API key to run. You have two options:
+
+**Option A: Set in `.env`** (recommended — keeps everything in one place)
+
+```bash
+# In ~/.clawdbot/.env — only set the ones you use:
+OPENAI_API_KEY="sk-..."          # For Codex CLI
+ANTHROPIC_API_KEY="sk-ant-..."   # For Claude Code
+GEMINI_API_KEY="AIza..."         # For Gemini CLI
+```
+
+**Option B: Set in your shell profile** (`~/.bashrc` or `~/.zshrc`)
+
+```bash
+export OPENAI_API_KEY="sk-..."
+```
+
+The `.env` file is sourced by `spawn-agent.sh` before launching the agent, so keys set there are automatically available. `.env` is gitignored and never committed.
+
 Create the runtime directories:
 
 ```bash

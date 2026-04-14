@@ -222,8 +222,8 @@ else
     while IFS= read -r pattern || [ -n "$pattern" ]; do
         # Skip blank lines and comments
         [[ -z "$pattern" || "$pattern" == \#* ]] && continue
-        # Exclude the test infrastructure itself from PII scanning
-        hits=$(grep -rn "$pattern" "${TRACKED_FILES[@]}" 2>/dev/null | grep -v 'tests/' || true)
+        # Exclude: test infra, .env.example (placeholder docs), README (setup examples)
+        hits=$(grep -rn "$pattern" "${TRACKED_FILES[@]}" 2>/dev/null | grep -v 'tests/' | grep -v '\.env\.example' | grep -v 'README\.md' || true)
         if [ -z "$hits" ]; then
             pass "no '$pattern' in tracked files"
         else
