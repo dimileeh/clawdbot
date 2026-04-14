@@ -84,6 +84,7 @@ for KEY in handled_threads in_progress handled_ci; do
     fi
 done
 
+# shellcheck disable=SC2034
 WAKE_REASONS=""
 MERGE_REASONS=""
 

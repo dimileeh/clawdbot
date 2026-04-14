@@ -12,6 +12,7 @@ CLAWDBOT_HOME="${CLAWDBOT_HOME:-$HOME/.clawdbot}"
 REGISTRY="$HOME/.clawdbot/active-tasks.json"
 LOG_DIR="$HOME/.clawdbot/logs"
 ALERTS=""
+# shellcheck disable=SC2034
 CHANGED=false
 
 if [ ! -f "$REGISTRY" ] || [ "$(cat "$REGISTRY")" = "[]" ]; then
@@ -29,6 +30,7 @@ for i in $(seq 0 $((TASK_COUNT - 1))); do
   TMUX_SESSION=$(echo "$TASK" | jq -r '.tmuxSession')
   BRANCH=$(echo "$TASK" | jq -r '.branch')
   REPO_PATH=$(echo "$TASK" | jq -r '.repoPath')
+  # shellcheck disable=SC2034
   REPO_NAME=$(echo "$TASK" | jq -r '.repo')
   RESPAWN_COUNT=$(echo "$TASK" | jq -r '.respawnCount // 0')
   MAX_RESPAWNS=$(echo "$TASK" | jq -r '.maxRespawns // 3')
@@ -147,6 +149,7 @@ for i in $(seq 0 $((TASK_COUNT - 1))); do
         ALERTS="$ALERTS\n❌ $TASK_ID: no PR and branch not pushed (tmux=dead, exit=${EXIT_CODE:-unknown}), max respawns reached"
       fi
     fi
+    # shellcheck disable=SC2034
     CHANGED=true
   else
     # Still running
