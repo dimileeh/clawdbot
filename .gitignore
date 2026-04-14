@@ -1,0 +1,18 @@
+# Runtime state (local only)
+*.json
+!package.json
+.env
+
+# Logs
+logs/
+
+# Agent workspace
+prompts/
+runners/
+memory/
+
+# Editor
+*.swp
+*.swo
+*~
+.DS_Store
