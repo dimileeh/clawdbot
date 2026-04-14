@@ -86,26 +86,35 @@ cp .env.example .env
 # Edit .env with your repos, GitHub owner, paths, etc.
 ```
 
-### API Keys
+### Agent Authentication
 
-Coding agents need their provider's API key to run. You have two options:
+Coding agents need access to their provider's API. There are two ways to authenticate:
 
-**Option A: Set in `.env`** (recommended — keeps everything in one place)
+**Option A: CLI OAuth login** (recommended — no keys to manage)
 
-```bash
-# In ~/.clawdbot/.env — only set the ones you use:
-OPENAI_API_KEY="sk-..."          # For Codex CLI
-ANTHROPIC_API_KEY="sk-ant-..."   # For Claude Code
-GEMINI_API_KEY="AIza..."         # For Gemini CLI
-```
-
-**Option B: Set in your shell profile** (`~/.bashrc` or `~/.zshrc`)
+Log in once on your machine, and all spawned agents inherit the session:
 
 ```bash
-export OPENAI_API_KEY="sk-..."
+codex auth     # OpenAI / Codex CLI
+claude login   # Anthropic / Claude Code
+gemini auth    # Google / Gemini CLI
 ```
 
-The `.env` file is sourced by `spawn-agent.sh` before launching the agent, so keys set there are automatically available. `.env` is gitignored and never committed.
+Credentials are stored in your home directory (`~/.codex/`, `~/.claude/`, etc.). Since `spawn-agent.sh` runs tmux as the same user, agents pick them up automatically.
+
+**Option B: API keys** (for headless servers or CI environments)
+
+Set keys in `~/.clawdbot/.env` — only the ones you use:
+
+```bash
+OPENAI_API_KEY="sk-..."          # Codex CLI
+ANTHROPIC_API_KEY="sk-ant-..."   # Claude Code
+GEMINI_API_KEY="AIza..."         # Gemini CLI
+```
+
+`spawn-agent.sh` sources `.env` before launching agents, so keys are automatically available. `.env` is gitignored and never committed.
+
+You can also set keys in your shell profile (`~/.bashrc`) — same effect.
 
 Create the runtime directories:
 
