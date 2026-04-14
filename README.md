@@ -151,7 +151,7 @@ Add this to your workspace `AGENTS.md` (or `HEARTBEAT.md`):
 ## Coding Agent Swarm
 
 ~/.clawdbot/ contains the swarm orchestration toolkit.
-- Spawn agents: `~/.clawdbot/spawn-agent.sh <task-id> <repo> <branch> <agent> <model> <thinking> "<prompt>"`
+- Spawn agents: `~/.clawdbot/spawn-agent.sh <task-id> <repo-path> <branch-name> <agent: codex|claude|gemini> <model> <thinking: low|medium|high|xhigh> "<prompt>"`
 - Check status: `~/.clawdbot/check-agents.sh`
 - Clean up: `~/.clawdbot/cleanup-task.sh <task-id>`
 - PR status: `~/.clawdbot/pr-unified-status.sh`
