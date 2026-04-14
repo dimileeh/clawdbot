@@ -394,6 +394,10 @@ git pull origin main
 
 Your `.env` and state files are gitignored, so pulls are clean.
 
+## Inspiration
+
+This project is inspired by [@elvissun](https://x.com/elvissun)'s article [OpenClaw + Codex/ClaudeCode Agent Swarm: The One-Person Dev Team](https://x.com/elvissun/status/2025920521871716562) — the original write-up on using OpenClaw as an orchestration layer for parallel coding agents. Elvis described the architecture and workflow but didn't release the source code, so we built it.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
