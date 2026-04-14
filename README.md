@@ -159,10 +159,11 @@ Add this to your workspace `AGENTS.md` (or `HEARTBEAT.md`):
 
 ### 2. Install the swarm skill (recommended)
 
-The [swarm skill](https://clawhub.ai) gives your agent structured knowledge of the full spawn → monitor → review → merge lifecycle:
+The swarm skill (`SKILL.md` in this repo) gives your agent structured knowledge of the full spawn → monitor → review → merge lifecycle. Copy it into your OpenClaw skills directory:
 
 ```bash
-openclaw skill install swarm
+mkdir -p ~/.openclaw/skills/swarm
+cp ~/.clawdbot/SKILL.md ~/.openclaw/skills/swarm/SKILL.md
 ```
 
 With the skill installed, you can just say *"spawn a Codex agent to fix the auth bug in my-backend"* and your agent handles the rest — worktree creation, prompt injection, tmux session, and monitoring.
