@@ -37,6 +37,31 @@ pr-manager.sh (*/10 cron)
 human reviews and merges main-targeted PRs
 ```
 
+## In Action
+
+<table>
+  <tr>
+    <td width="50%">
+      <img src=".github/readme/01-swarm-deploy.jpg" alt="Swarm deployment — 2 agents spawned in parallel" />
+      <p align="center"><b>Swarm Deploy</b> — Codex + Claude Code spawned in parallel, each in its own worktree</p>
+    </td>
+    <td width="50%">
+      <img src=".github/readme/02-pr-review-summary.jpg" alt="Automated PR review summary" />
+      <p align="center"><b>Auto Review</b> — Bot review threads resolved with fixes, all tests passing</p>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%">
+      <img src=".github/readme/03-review-resolution.jpg" alt="Review resolution with 1388 tests" />
+      <p align="center"><b>Review Resolution</b> — 11 threads resolved across 5 real issues, 1388 tests ✅</p>
+    </td>
+    <td width="50%">
+      <img src=".github/readme/04-delivery-notification.jpg" alt="Delivery notification with PRs ready for merge" />
+      <p align="center"><b>Delivery</b> — Both agents done, dev→main PRs ready for human merge</p>
+    </td>
+  </tr>
+</table>
+
 ## Prerequisites
 
 - [OpenClaw](https://github.com/openclaw/openclaw) — installed and authenticated
@@ -84,12 +109,6 @@ crontab -e
 */3 * * * * /home/YOU/.clawdbot/swarm-monitor.sh
 ```
 
-Add `bin/` to PATH for the protected `gh` wrapper (optional but recommended):
-
-```bash
-export PATH="$HOME/.clawdbot/bin:$PATH"
-```
-
 ## Configuration
 
 All config lives in `.env` (gitignored). Copy `.env.example` and fill in your values:
@@ -134,9 +153,6 @@ Every script sources `.env` on startup with safe fallbacks, so existing env vars
 ├── AGENTS.md             # Instructions injected into every agent
 ├── README.md
 ├── LICENSE
-├── bin/
-│   └── gh                # gh wrapper enforcing branch protection
-│
 ├── spawn-agent.sh        # Spawn a coding agent in a worktree
 ├── check-agents.sh       # Check status of all tracked tasks
 ├── cleanup-task.sh       # Clean up finished task worktree
@@ -235,7 +251,7 @@ The result: agents code, push, get reviewed, fix review feedback, and re-push �
 
 ## Safety rails
 
-- **`bin/gh` wrapper** — rejects `gh pr create` calls that don't target the integration branch
+- **Runtime `gh` wrapper** — `spawn-agent.sh` generates a `gh` shim in a temp dir that rejects PRs not targeting the integration branch
 - **Worktree isolation** — each task gets its own worktree; no cross-contamination
 - **Human-only main merges** — PRs to main are never auto-merged
 - **State files** — all automation state is in readable JSON files
