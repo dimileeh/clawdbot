@@ -16,18 +16,22 @@ export PATH="${CLAWDBOT_NODE_PATH:-$HOME/.nvm/versions/node/v24.13.0/bin}:$HOME/
 # Generated at runtime into a temp dir (not committed to repo).
 REAL_GH_BIN="$(command -v gh || true)"
 CLAWDBOT_BIN_DIR="$(mktemp -d "${TMPDIR:-/tmp}/clawdbot-bin.XXXXXX")"
+_INTEGRATION="${CLAWDBOT_INTEGRATION_BRANCH:-development}"
+cleanup_bin_dir() { rm -rf "$CLAWDBOT_BIN_DIR"; }
+trap cleanup_bin_dir EXIT
 if [ -n "$REAL_GH_BIN" ]; then
   cat > "$CLAWDBOT_BIN_DIR/gh" <<'GHWRAPPER'
 #!/usr/bin/env bash
 set -euo pipefail
 
 REAL_GH_BIN="${REAL_GH_BIN:?REAL_GH_BIN env var not set}"
+_TARGET_BRANCH="${_CLAWDBOT_TARGET_BRANCH:?_CLAWDBOT_TARGET_BRANCH not set}"
 
 # Enforce: NEVER allow PRs targeting main from automation.
 if [ "${1-}" = "pr" ] && [ "${2-}" = "create" ]; then
   # Require explicit base.
   if ! printf '%q ' "$@" | grep -q -- "--base"; then
-    echo "ERROR: gh pr create must specify --base development (never default)" >&2
+    echo "ERROR: gh pr create must specify --base $_TARGET_BRANCH (never default)" >&2
     exit 2
   fi
 
@@ -37,9 +41,9 @@ if [ "${1-}" = "pr" ] && [ "${2-}" = "create" ]; then
     exit 2
   fi
 
-  # Enforce base=development.
-  if ! printf '%q ' "$@" | grep -q -- "--base development"; then
-    echo "ERROR: gh pr create must use --base development" >&2
+  # Enforce base=$_TARGET_BRANCH.
+  if ! printf '%q ' "$@" | grep -q -- "--base $_TARGET_BRANCH"; then
+    echo "ERROR: gh pr create must use --base $_TARGET_BRANCH" >&2
     exit 2
   fi
 
@@ -206,6 +210,7 @@ CLAWDBOT_HOME="${CLAWDBOT_HOME:-$HOME/.clawdbot}"
 [ -f "$CLAWDBOT_HOME/.env" ] && set -a && source "$CLAWDBOT_HOME/.env" && set +a
 export PATH="$CLAWDBOT_BIN_DIR:${CLAWDBOT_NODE_PATH:-$HOME/.nvm/versions/node/v24.13.0/bin}:$HOME/.local/bin:\$PATH"
 export REAL_GH_BIN="$REAL_GH_BIN"
+export _CLAWDBOT_TARGET_BRANCH="$_INTEGRATION"
 
 # Provide attribution context to the gh wrapper
 export CLAWDBOT_TASK_ID="$TASK_ID"

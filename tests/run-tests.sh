@@ -69,10 +69,11 @@ else
     fail "spawn-agent.sh missing main branch protection in gh wrapper"
 fi
 
-if grep -q 'base development' "$REPO_DIR/spawn-agent.sh" 2>/dev/null; then
-    pass "spawn-agent.sh enforces --base development"
+if grep -q '_TARGET_BRANCH' "$REPO_DIR/spawn-agent.sh" 2>/dev/null && \
+   grep -q '_CLAWDBOT_TARGET_BRANCH' "$REPO_DIR/spawn-agent.sh" 2>/dev/null; then
+    pass "spawn-agent.sh enforces --base via CLAWDBOT_INTEGRATION_BRANCH"
 else
-    fail "spawn-agent.sh missing --base development enforcement"
+    fail "spawn-agent.sh missing integration branch enforcement"
 fi
 
 if grep -q 'Created-by:' "$REPO_DIR/spawn-agent.sh" 2>/dev/null; then
@@ -86,13 +87,19 @@ if grep -q 'mktemp.*clawdbot-bin' "$REPO_DIR/spawn-agent.sh" 2>/dev/null; then
 else
     fail "gh wrapper not using temp dir"
 fi
+
+if grep -q 'trap.*cleanup_bin_dir.*EXIT' "$REPO_DIR/spawn-agent.sh" 2>/dev/null; then
+    pass "temp dir cleaned up on EXIT trap"
+else
+    fail "missing EXIT trap for temp dir cleanup"
+fi
 echo ""
 
 # ─── Layer 4: .env.example completeness ────────────────────────────────────
 echo "Layer 4: .env.example completeness"
 
 # Runtime-only vars set internally by scripts (not user config)
-RUNTIME_VARS="CLAWDBOT_AGENT CLAWDBOT_BIN CLAWDBOT_BIN_DIR CLAWDBOT_TASK_ID CLAWDBOT_WORKTREE"
+RUNTIME_VARS="CLAWDBOT_AGENT CLAWDBOT_BIN CLAWDBOT_BIN_DIR CLAWDBOT_TARGET_BRANCH CLAWDBOT_TASK_ID CLAWDBOT_WORKTREE"
 
 USED_VARS=$(grep -roh 'CLAWDBOT_[A-Z_]*' "$REPO_DIR"/*.sh 2>/dev/null | sort -u)
 for var in $USED_VARS; do
