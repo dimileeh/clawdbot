@@ -109,6 +109,69 @@ crontab -e
 */3 * * * * /home/YOU/.clawdbot/swarm-monitor.sh
 ```
 
+## Connecting to your OpenClaw agent
+
+clawdbot is the infrastructure — your OpenClaw agent is the brain that drives it. You need to tell your agent that `~/.clawdbot/` exists and how to use it.
+
+### 1. Tell your agent about clawdbot
+
+Add this to your workspace `AGENTS.md` (or `HEARTBEAT.md`):
+
+```markdown
+## Coding Agent Swarm
+
+~/.clawdbot/ contains the swarm orchestration toolkit.
+- Spawn agents: `~/.clawdbot/spawn-agent.sh <task-id> <repo> <branch> <agent> <model> <thinking> "<prompt>"`
+- Check status: `~/.clawdbot/check-agents.sh`
+- Clean up: `~/.clawdbot/cleanup-task.sh <task-id>`
+- PR status: `~/.clawdbot/pr-unified-status.sh`
+```
+
+### 2. Install the swarm skill (recommended)
+
+The [swarm skill](https://clawhub.ai) gives your agent structured knowledge of the full spawn → monitor → review → merge lifecycle:
+
+```bash
+openclaw skill install swarm
+```
+
+With the skill installed, you can just say *"spawn a Codex agent to fix the auth bug in my-backend"* and your agent handles the rest — worktree creation, prompt injection, tmux session, and monitoring.
+
+### 3. How the pieces connect
+
+```
+You (chat with your OpenClaw agent)
+ ↓
+"Fix the auth bug and add the dashboard feature"
+ ↓
+OpenClaw agent reads swarm skill → calls spawn-agent.sh (×2)
+ ↓
+Coding agents work in isolated worktrees → push → open PRs
+ ↓
+swarm-monitor.sh (cron) detects CI failure / PR ready
+ ↓
+`openclaw cron wake` → wakes your agent
+ ↓
+Agent auto-fixes CI, resolves reviews, notifies you when ready
+ ↓
+You review and merge to main
+```
+
+The cron jobs (`swarm-monitor.sh`, `pr-manager.sh`) are the glue — they run pure bash with zero LLM cost, and only wake your OpenClaw agent when something actually needs attention.
+
+### 4. Customize AGENTS.md
+
+`AGENTS.md` is injected into every spawned agent's worktree. This is where you encode your team's standards:
+
+- TDD requirements
+- Code style and conventions
+- Git commit format
+- PR description template
+- Which skills to load
+- What NOT to do
+
+Edit it to match your workflow. The default covers TDD, conventional commits, and clean code.
+
 ## Configuration
 
 All config lives in `.env` (gitignored). Copy `.env.example` and fill in your values:
@@ -267,18 +330,6 @@ The result: agents code, push, get reviewed, fix review feedback, and re-push �
 | Gemini | `gemini` | `--yolo`, configurable model |
 
 Adjust defaults in `spawn-agent.sh` or override via `.env`.
-
-## AGENTS.md
-
-The template instruction file injected into every agent's worktree. This is where you encode:
-- Coding standards and conventions
-- TDD requirements (RED→GREEN→REFACTOR)
-- Git discipline (branch naming, commit messages)
-- PR description format
-- Testing requirements
-- What NOT to do
-
-Customize this for your team's workflow.
 
 ## Agent skills
 
