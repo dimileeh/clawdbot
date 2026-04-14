@@ -44,24 +44,24 @@ Choose agent(s) and spawn:
   "<prompt>"
 ```
 
-**Which agent (from Elvis's swarm architecture):**
+**Which agent:**
 
 Codex is the **primary workhorse** — most tasks go here. Claude Code and Gemini are specialists.
 
 | Agent | Model | Flags | Best For |
 |---|---|---|---|
-| **codex** | `gpt-5.3-codex` | `--dangerously-bypass-approvals-and-sandbox`, `model_reasoning_effort=high` | Default for most tasks. Fast, autonomous, great at JS/TS/Python. Use for feature implementation, bug fixes, CRUD, API endpoints, UI components. The bulk of your swarm. |
-| **claude** | `claude-sonnet-4-6` or `claude-opus-4-6` | `--dangerously-skip-permissions -p` | Complex architectural work, security-sensitive code, nuanced refactors where judgment matters. Use opus for critical/production code, sonnet for standard work. Better at understanding existing patterns and maintaining consistency. |
+| **codex** | `gpt-5.4` | `--dangerously-bypass-approvals-and-sandbox`, `model_reasoning_effort=high` | Default for most tasks. Fast, autonomous, great at JS/TS/Python. Use for feature implementation, bug fixes, CRUD, API endpoints, UI components. The bulk of your swarm. |
+| **claude** | `claude-opus-4-6` or `claude-opus-4-6` | `--dangerously-skip-permissions -p` | Complex architectural work, security-sensitive code, nuanced refactors where judgment matters. Use opus for critical/production code, sonnet for standard work. Better at understanding existing patterns and maintaining consistency. |
 | **gemini** | `gemini-2.5-pro` | `--yolo -p` | Large codebase analysis, broad multi-file refactors, tasks requiring huge context windows. Good when you need to read and understand a lot of code before making changes. |
 
 **Selection heuristic:**
-1. Can Codex handle this? → **Codex** (default, ~60-70% of tasks)
-2. Is it security/auth/complex architecture? → **Claude**
+1. Can Codex handle this? Or is it related to the backend?  → **Codex** (default, ~60-70% of tasks)
+2. Is it security/auth/complex architecture? Or is it a UI/UX/Frontend problem? → **Claude**
 3. Does it need massive context or cross-cutting analysis? → **Gemini**
 4. Not sure? → **Codex** first, respawn with Claude if it fails
 
 **Parallel swarm pattern (from the diagram):**
-Elvis runs multiple Codex agents in parallel (Agent 1, 2, 3...) for independent features, with Claude Code and Gemini as single specialist agents. The typical swarm is 3-5 Codex + 1 Claude or Gemini when needed.
+We can run multiple Codex agents in parallel (Agent 1, 2, 3...) for independent features, with Claude Code and Gemini as single specialist agents. The typical swarm is 3-5 Codex + 1 Claude or Gemini when needed.
 
 **How many:**
 - Trivial → edit directly, no agent
@@ -106,14 +106,13 @@ When agents complete, review the PR and report to the user. Include what was bui
 | Cleanup script | `~/.clawdbot/cleanup-task.sh` |
 | Task registry | `~/.clawdbot/active-tasks.json` |
 | Logs | `~/.clawdbot/logs/<task-id>.log` |
-| Worktrees | `~/Projects/aira-worktrees/` |
+| Worktrees | `<repo>/.worktrees/<branch>/` |
 | Global agent instructions | `~/.clawdbot/AGENTS.md` |
 | Skills library | `~/Projects/antigravity-awesome-skills/skills/` |
 
 ## Repo Paths
-- Backend: `~/Projects/aira/aira-agent`
-- Frontend: `~/Projects/aira/aira-web`
-- Landing: `~/Projects/aira/aira-lead-generation-page`
+
+Configure your repo paths in `~/.clawdbot/.env` via `CLAWDBOT_PROJECTS_ROOT` and `CLAWDBOT_REPO_MAP`.
 
 ## Branch Naming
 - `feat/<short-description>`, `fix/<short-description>`, `refactor/<short-description>`
