@@ -177,7 +177,7 @@ elif [ "$AGENT" = "claude" ]; then
   MODEL="${CLAWDBOT_CLAUDE_MODEL:-claude-opus-4-7}"
   AGENT_CMD="claude --model $MODEL --dangerously-skip-permissions -p 'Read and follow all instructions in .clawdbot_prompt.md'"
 elif [ "$AGENT" = "gemini" ]; then
-  MODEL="gemini-3"
+  MODEL="${CLAWDBOT_GEMINI_MODEL:-gemini-2.5-pro}"
   AGENT_CMD="${CLAWDBOT_NODE_PATH:-$HOME/.nvm/versions/node/v24.13.0/bin}/gemini --model $MODEL --yolo -p 'Read and follow all instructions in .clawdbot_prompt.md'"
 else
   echo "Unknown agent: $AGENT (use codex, claude, or gemini)"
