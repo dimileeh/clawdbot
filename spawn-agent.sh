@@ -82,6 +82,7 @@ REPO_PATH="${2:?Missing repo path}"
 BRANCH="${3:?Missing branch name}"
 AGENT="${4:?Missing agent: codex|claude|gemini}"
 MODEL="${5:?Missing model}"
+REQUESTED_MODEL="$MODEL"
 THINKING="${6:?Missing thinking level}"
 PROMPT="${7:?Missing prompt}"
 
@@ -174,10 +175,10 @@ if [ "$AGENT" = "codex" ]; then
   THINKING="xhigh"
   AGENT_CMD="${CLAWDBOT_NODE_PATH:-$HOME/.nvm/versions/node/v24.13.0/bin}/codex exec -m $MODEL -c model_reasoning_effort=\"$THINKING\" --dangerously-bypass-approvals-and-sandbox \"Read and follow all instructions in .clawdbot_prompt.md\""
 elif [ "$AGENT" = "claude" ]; then
-  MODEL="${CLAWDBOT_CLAUDE_MODEL:-claude-opus-4-7}"
+  MODEL="${REQUESTED_MODEL:-${CLAWDBOT_CLAUDE_MODEL:-claude-opus-4-7}}"
   AGENT_CMD="claude --model $MODEL --dangerously-skip-permissions -p 'Read and follow all instructions in .clawdbot_prompt.md'"
 elif [ "$AGENT" = "gemini" ]; then
-  MODEL="${CLAWDBOT_GEMINI_MODEL:-gemini-2.5-pro}"
+  MODEL="${REQUESTED_MODEL:-${CLAWDBOT_GEMINI_MODEL:-gemini-2.5-pro}}"
   AGENT_CMD="${CLAWDBOT_NODE_PATH:-$HOME/.nvm/versions/node/v24.13.0/bin}/gemini --model $MODEL --yolo -p 'Read and follow all instructions in .clawdbot_prompt.md'"
 else
   echo "Unknown agent: $AGENT (use codex, claude, or gemini)"
