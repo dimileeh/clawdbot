@@ -220,7 +220,7 @@ for REPO in $REPOS; do
                                 --name "CI Fix: ${REPO}#${PR_NUM}" \
                                 --at "30s" \
                                 --session isolated \
-                                --model "${CLAWDBOT_REVIEW_MODEL:-anthropic/claude-opus-4-6}" \
+                                --model "${CLAWDBOT_REVIEW_MODEL:-anthropic/claude-opus-4-7}" \
                                 --timeout-seconds 1200 \
                                 --announce \
                                 --channel "${CLAWDBOT_NOTIFY_CHANNEL:-telegram}" \
@@ -431,7 +431,7 @@ if [ "$UNRESOLVED_COUNT" -gt 0 ]; then
             --name "PR Review: ${PR_REPO}#${PR_NUM}" \
             --at "30s" \
             --session isolated \
-            --model "${CLAWDBOT_REVIEW_MODEL:-anthropic/claude-opus-4-6}" \
+            --model "${CLAWDBOT_REVIEW_MODEL:-anthropic/claude-opus-4-7}" \
             --timeout-seconds 1200 \
             --announce \
             --channel "${CLAWDBOT_NOTIFY_CHANNEL:-telegram}" \

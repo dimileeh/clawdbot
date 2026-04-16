@@ -174,7 +174,7 @@ if [ "$AGENT" = "codex" ]; then
   THINKING="xhigh"
   AGENT_CMD="${CLAWDBOT_NODE_PATH:-$HOME/.nvm/versions/node/v24.13.0/bin}/codex exec -m $MODEL -c model_reasoning_effort=\"$THINKING\" --dangerously-bypass-approvals-and-sandbox \"Read and follow all instructions in .clawdbot_prompt.md\""
 elif [ "$AGENT" = "claude" ]; then
-  MODEL="claude-opus-4-6"
+  MODEL="${CLAWDBOT_CLAUDE_MODEL:-claude-opus-4-7}"
   AGENT_CMD="claude --model $MODEL --dangerously-skip-permissions -p 'Read and follow all instructions in .clawdbot_prompt.md'"
 elif [ "$AGENT" = "gemini" ]; then
   MODEL="gemini-3"
