@@ -51,7 +51,7 @@ Codex is the **primary workhorse** — most tasks go here. Claude Code and Gemin
 | Agent | Model | Flags | Best For |
 |---|---|---|---|
 | **codex** | `gpt-5.4` | `--dangerously-bypass-approvals-and-sandbox`, `model_reasoning_effort=high` | Default for most tasks. Fast, autonomous, great at JS/TS/Python. Use for feature implementation, bug fixes, CRUD, API endpoints, UI components. The bulk of your swarm. |
-| **claude** | `claude-opus-4-7` or `claude-opus-4-7` | `--dangerously-skip-permissions -p` | Complex architectural work, security-sensitive code, nuanced refactors where judgment matters. Use opus for critical/production code, sonnet for standard work. Better at understanding existing patterns and maintaining consistency. |
+| **claude** | `claude-opus-4-7` | `--dangerously-skip-permissions -p` | Complex architectural work, security-sensitive code, nuanced refactors where judgment matters. Use opus for critical/production code, sonnet for standard work. Better at understanding existing patterns and maintaining consistency. |
 | **gemini** | `gemini-2.5-pro` | `--yolo -p` | Large codebase analysis, broad multi-file refactors, tasks requiring huge context windows. Good when you need to read and understand a lot of code before making changes. |
 
 **Selection heuristic:**
