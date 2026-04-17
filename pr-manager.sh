@@ -422,7 +422,11 @@ if [ "$UNRESOLVED_COUNT" -gt 0 ]; then
             continue
         fi
 
-        CUTOFF_WAIT=$(date -u -d "${REVIEW_WAIT_MINUTES} minutes ago" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)
+        CUTOFF_WAIT=$(date -u -d "${REVIEW_WAIT_MINUTES} minutes ago" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)
+        if [ -z "$CUTOFF_WAIT" ]; then
+            echo "$LOG_PREFIX   ⚠️ 'date -d' failed (non-GNU date?), disabling review wait window for this check"
+            CUTOFF_WAIT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+        fi
         if [[ "$WAIT_FIRST_SEEN" > "$CUTOFF_WAIT" ]]; then
             echo "$LOG_PREFIX   ⏳ $PR_KEY still inside ${REVIEW_WAIT_MINUTES}m review window (since $WAIT_FIRST_SEEN), waiting"
             continue
@@ -441,9 +445,10 @@ if [ "$UNRESOLVED_COUNT" -gt 0 ]; then
         # Determine test command (auto-detect from project type)
         TEST_CMD="$(_detect_test_cmd "$LOCAL_PATH")"
 
-        # Mark in progress and reset the review wait window baseline for the next wave.
-        jq --arg key "$PR_KEY" --arg ts "$NOW_ISO" --arg sha "$PR_HEAD_SHA" \
-            '.in_progress[$key] = $ts | .review_wait[$key] = {first_seen: $ts, head_sha: $sha}' "$REVIEW_STATE_FILE" > "${REVIEW_STATE_FILE}.tmp" && \
+        # Mark in progress and clear the baseline; if unresolved threads remain later,
+        # the next manager pass will start a fresh wait window from first observation.
+        jq --arg key "$PR_KEY" --arg ts "$NOW_ISO" \
+            '.in_progress[$key] = $ts | del(.review_wait[$key])' "$REVIEW_STATE_FILE" > "${REVIEW_STATE_FILE}.tmp" && \
             mv "${REVIEW_STATE_FILE}.tmp" "$REVIEW_STATE_FILE"
 
         # Spawn isolated session — one per PR, 20 min timeout
