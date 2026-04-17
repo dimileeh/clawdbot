@@ -437,11 +437,12 @@ if [ "$UNRESOLVED_COUNT" -gt 0 ]; then
                 '.review_wait[$key] = {first_seen: $ts, head_sha: $sha}' "$REVIEW_STATE_FILE" > "${REVIEW_STATE_FILE}.tmp" && \
                 mv "${REVIEW_STATE_FILE}.tmp" "$REVIEW_STATE_FILE"
             if [ "$REVIEW_WAIT_MINUTES" -eq 0 ]; then
-                echo "$LOG_PREFIX   ⏱️ Review wait window disabled (REVIEW_WAIT_MINUTES=0); will spawn on next pass for $PR_KEY"
+                echo "$LOG_PREFIX   ⏱️ Review wait window disabled (REVIEW_WAIT_MINUTES=0); spawning immediately for $PR_KEY"
+                # Fall through to spawn logic on this same pass — no one-cycle delay.
             else
                 echo "$LOG_PREFIX   ⏱️ Starting ${REVIEW_WAIT_MINUTES}m review window for $PR_KEY at commit ${PR_HEAD_SHA:0:12} ($THREAD_COUNT thread(s))"
+                continue
             fi
-            continue
         fi
 
         if [ "$REVIEW_WAIT_MINUTES" -eq 0 ]; then
