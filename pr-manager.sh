@@ -51,6 +51,13 @@ _resolve_repo_path() {
 }
 
 # Auto-detect test command from project files.
+#
+# Precedence: Python (pyproject.toml / setup.py) > Node (package.json) > a
+# repo-local bash test harness at tests/run-tests.sh. The bash harness is a
+# last resort for shell-only repos that don't have a package manager but
+# still ship their own test runner; without it, such repos would fall
+# through to "No test command configured" and the review handler would
+# have no way to verify its own fix before committing.
 _detect_test_cmd() {
     local path="$1"
     if [ -f "$path/pyproject.toml" ] || [ -f "$path/setup.py" ]; then
@@ -63,6 +70,8 @@ _detect_test_cmd() {
         else
             echo "npx next build"
         fi
+    elif [ -f "$path/tests/run-tests.sh" ]; then
+        echo "bash tests/run-tests.sh"
     else
         echo "echo 'No test command configured'"
     fi
