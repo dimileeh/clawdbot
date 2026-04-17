@@ -192,6 +192,38 @@ else
     fail "_detect_test_cmd falls back to next build for Node without test (got: $result)"
 fi
 
+# Bash project with tests/run-tests.sh — no pyproject.toml or package.json,
+# just a repo-local bash test harness. Should prefer the harness over the
+# "No test command" fallback so the review handler can verify its own fix.
+mkdir -p "$TEST_TMP/bash-proj/tests"
+cat > "$TEST_TMP/bash-proj/tests/run-tests.sh" <<'EOF'
+#!/bin/bash
+exit 0
+EOF
+chmod +x "$TEST_TMP/bash-proj/tests/run-tests.sh"
+result=$(_detect_test_cmd "$TEST_TMP/bash-proj")
+if [[ "$result" == *"tests/run-tests.sh"* ]]; then
+    pass "_detect_test_cmd detects repo-local bash test harness"
+else
+    fail "_detect_test_cmd detects repo-local bash test harness (got: $result)"
+fi
+
+# Bash test harness must not override a Python or Node harness when both
+# signals are present (pyproject.toml / package.json take precedence because
+# those ecosystems have richer test runners than bash).
+mkdir -p "$TEST_TMP/python-with-bash/tests"
+touch "$TEST_TMP/python-with-bash/pyproject.toml"
+cat > "$TEST_TMP/python-with-bash/tests/run-tests.sh" <<'EOF'
+#!/bin/bash
+exit 0
+EOF
+result=$(_detect_test_cmd "$TEST_TMP/python-with-bash")
+if [[ "$result" == *"pytest"* ]]; then
+    pass "_detect_test_cmd prefers Python harness over bash fallback"
+else
+    fail "_detect_test_cmd prefers Python harness over bash fallback (got: $result)"
+fi
+
 # Unknown project
 mkdir -p "$TEST_TMP/empty-proj"
 result=$(_detect_test_cmd "$TEST_TMP/empty-proj")
