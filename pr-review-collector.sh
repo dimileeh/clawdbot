@@ -33,6 +33,13 @@ for REPO in $REPOS; do
             headRefName
             url
             isDraft
+            commits(last: 1) {
+              nodes {
+                commit {
+                  oid
+                }
+              }
+            }
             reviewThreads(first: 100) {
               nodes {
                 id
@@ -68,6 +75,7 @@ for REPO in $REPOS; do
            title: .title,
            base: .baseRefName,
            head: .headRefName,
+           head_sha: (.commits.nodes[0].commit.oid // ""),
            url: .url,
            unresolved_threads: [
              .reviewThreads.nodes[]

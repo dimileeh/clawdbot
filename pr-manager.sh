@@ -34,6 +34,7 @@ REPOS="${CLAWDBOT_REPOS:?Set CLAWDBOT_REPOS in .env}"
 STATE_FILE="$HOME/.clawdbot/pr-manager-state.json"
 REVIEW_STATE_FILE="$HOME/.clawdbot/pr-review-handler-state.json"
 LOG_PREFIX="[pr-manager $(date -u +%H:%M:%S)]"
+REVIEW_WAIT_MINUTES="${CLAWDBOT_REVIEW_WAIT_MINUTES:-15}"
 
 # ── Helper Functions ──────────────────────────────────────────────
 
@@ -70,7 +71,7 @@ _detect_test_cmd() {
 # ── State Files ───────────────────────────────────────────────────
 
 [ -f "$STATE_FILE" ] || echo '{"notified_main_prs":{},"merged_prs":{},"created_dev_main_prs":{}}' > "$STATE_FILE"
-[ -f "$REVIEW_STATE_FILE" ] || echo '{"handled_threads":{},"in_progress":{}}' > "$REVIEW_STATE_FILE"
+[ -f "$REVIEW_STATE_FILE" ] || echo '{"handled_threads":{},"in_progress":{},"review_wait":{},"handled_ci":{}}' > "$REVIEW_STATE_FILE"
 
 # Ensure all keys exist
 for KEY in notified_main_prs merged_prs created_dev_main_prs; do
@@ -78,7 +79,7 @@ for KEY in notified_main_prs merged_prs created_dev_main_prs; do
         jq ". + {\"$KEY\":{}}" "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
     fi
 done
-for KEY in handled_threads in_progress handled_ci; do
+for KEY in handled_threads in_progress handled_ci review_wait; do
     if ! jq -e ".$KEY" "$REVIEW_STATE_FILE" >/dev/null 2>&1; then
         jq ". + {\"$KEY\":{}}" "$REVIEW_STATE_FILE" > "${REVIEW_STATE_FILE}.tmp" && mv "${REVIEW_STATE_FILE}.tmp" "$REVIEW_STATE_FILE"
     fi
@@ -398,8 +399,10 @@ if [ "$UNRESOLVED_COUNT" -gt 0 ]; then
         PR_REPO=$(echo "$PR_JSON" | jq -r '.repo')
         PR_NUM=$(echo "$PR_JSON" | jq -r '.number')
         PR_HEAD=$(echo "$PR_JSON" | jq -r '.head')
+        PR_HEAD_SHA=$(echo "$PR_JSON" | jq -r '.head_sha // ""')
         PR_KEY="${PR_REPO}#${PR_NUM}"
         THREAD_COUNT=$(echo "$PR_JSON" | jq '.unresolved_threads | length')
+        NOW_ISO=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
         # Check if already in progress (30 min cooldown)
         IN_PROGRESS_TS=$(jq -r ".in_progress[\"$PR_KEY\"] // \"\"" "$REVIEW_STATE_FILE")
@@ -408,7 +411,24 @@ if [ "$UNRESOLVED_COUNT" -gt 0 ]; then
             continue
         fi
 
-        echo "$LOG_PREFIX   🔍 Spawning review handler for $PR_KEY ($THREAD_COUNT thread(s))..."
+        WAIT_FIRST_SEEN=$(jq -r ".review_wait[\"$PR_KEY\"].first_seen // \"\"" "$REVIEW_STATE_FILE")
+        WAIT_HEAD_SHA=$(jq -r ".review_wait[\"$PR_KEY\"].head_sha // \"\"" "$REVIEW_STATE_FILE")
+
+        if [ -z "$WAIT_FIRST_SEEN" ] || [ "$WAIT_HEAD_SHA" != "$PR_HEAD_SHA" ]; then
+            jq --arg key "$PR_KEY" --arg ts "$NOW_ISO" --arg sha "$PR_HEAD_SHA" \
+                '.review_wait[$key] = {first_seen: $ts, head_sha: $sha}' "$REVIEW_STATE_FILE" > "${REVIEW_STATE_FILE}.tmp" && \
+                mv "${REVIEW_STATE_FILE}.tmp" "$REVIEW_STATE_FILE"
+            echo "$LOG_PREFIX   ⏱️ Starting ${REVIEW_WAIT_MINUTES}m review window for $PR_KEY at commit ${PR_HEAD_SHA:0:12} ($THREAD_COUNT thread(s))"
+            continue
+        fi
+
+        CUTOFF_WAIT=$(date -u -d "${REVIEW_WAIT_MINUTES} minutes ago" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)
+        if [[ "$WAIT_FIRST_SEEN" > "$CUTOFF_WAIT" ]]; then
+            echo "$LOG_PREFIX   ⏳ $PR_KEY still inside ${REVIEW_WAIT_MINUTES}m review window (since $WAIT_FIRST_SEEN), waiting"
+            continue
+        fi
+
+        echo "$LOG_PREFIX   🔍 Review window elapsed, spawning handler for $PR_KEY ($THREAD_COUNT thread(s))..."
 
         # Write per-PR thread data
         PR_THREAD_FILE="/tmp/pr-review-${PR_REPO//\//-}-${PR_NUM}.json"
@@ -421,9 +441,9 @@ if [ "$UNRESOLVED_COUNT" -gt 0 ]; then
         # Determine test command (auto-detect from project type)
         TEST_CMD="$(_detect_test_cmd "$LOCAL_PATH")"
 
-        # Mark in progress
-        jq --arg key "$PR_KEY" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            '.in_progress[$key] = $ts' "$REVIEW_STATE_FILE" > "${REVIEW_STATE_FILE}.tmp" && \
+        # Mark in progress and reset the review wait window baseline for the next wave.
+        jq --arg key "$PR_KEY" --arg ts "$NOW_ISO" --arg sha "$PR_HEAD_SHA" \
+            '.in_progress[$key] = $ts | .review_wait[$key] = {first_seen: $ts, head_sha: $sha}' "$REVIEW_STATE_FILE" > "${REVIEW_STATE_FILE}.tmp" && \
             mv "${REVIEW_STATE_FILE}.tmp" "$REVIEW_STATE_FILE"
 
         # Spawn isolated session — one per PR, 20 min timeout
@@ -500,6 +520,7 @@ CUTOFF_7D=$(date -u -d "7 days ago" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +
 jq --arg cutoff "$CUTOFF_7D" '
   .handled_threads = (.handled_threads // {} | to_entries | map(select(.value > $cutoff)) | from_entries)
   | .handled_ci = (.handled_ci // {} | to_entries | map(select(.value > $cutoff)) | from_entries)
+  | .review_wait = (.review_wait // {} | to_entries | map(select((.value.first_seen // "") > $cutoff)) | from_entries)
 ' "$REVIEW_STATE_FILE" > "${REVIEW_STATE_FILE}.tmp" 2>/dev/null && mv "${REVIEW_STATE_FILE}.tmp" "$REVIEW_STATE_FILE" || true
 
 # ─── Clean up old temp files (>1 day) ───
