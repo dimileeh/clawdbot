@@ -34,6 +34,16 @@ REPOS="${CLAWDBOT_REPOS:?Set CLAWDBOT_REPOS in .env}"
 STATE_FILE="$HOME/.clawdbot/pr-manager-state.json"
 REVIEW_STATE_FILE="$HOME/.clawdbot/pr-review-handler-state.json"
 LOG_PREFIX="[pr-manager $(date -u +%H:%M:%S)]"
+# Normalize review wait window: must be a non-negative integer.
+# 0 explicitly disables the wait window (spawn on first observation).
+# Malformed values fall back to the 15-minute default.
+REVIEW_WAIT_MINUTES_RAW="${CLAWDBOT_REVIEW_WAIT_MINUTES:-15}"
+if [[ "$REVIEW_WAIT_MINUTES_RAW" =~ ^[0-9]+$ ]]; then
+    REVIEW_WAIT_MINUTES="$REVIEW_WAIT_MINUTES_RAW"
+else
+    echo "[pr-manager] ⚠️ Invalid CLAWDBOT_REVIEW_WAIT_MINUTES='$REVIEW_WAIT_MINUTES_RAW' (must be non-negative integer); using default 15" >&2
+    REVIEW_WAIT_MINUTES=15
+fi
 
 # ── Helper Functions ──────────────────────────────────────────────
 
@@ -50,6 +60,13 @@ _resolve_repo_path() {
 }
 
 # Auto-detect test command from project files.
+#
+# Precedence: Python (pyproject.toml / setup.py) > Node (package.json) > a
+# repo-local bash test harness at tests/run-tests.sh. The bash harness is a
+# last resort for shell-only repos that don't have a package manager but
+# still ship their own test runner; without it, such repos would fall
+# through to "No test command configured" and the review handler would
+# have no way to verify its own fix before committing.
 _detect_test_cmd() {
     local path="$1"
     if [ -f "$path/pyproject.toml" ] || [ -f "$path/setup.py" ]; then
@@ -62,6 +79,8 @@ _detect_test_cmd() {
         else
             echo "npx next build"
         fi
+    elif [ -f "$path/tests/run-tests.sh" ]; then
+        echo "bash tests/run-tests.sh"
     else
         echo "echo 'No test command configured'"
     fi
@@ -70,7 +89,7 @@ _detect_test_cmd() {
 # ── State Files ───────────────────────────────────────────────────
 
 [ -f "$STATE_FILE" ] || echo '{"notified_main_prs":{},"merged_prs":{},"created_dev_main_prs":{}}' > "$STATE_FILE"
-[ -f "$REVIEW_STATE_FILE" ] || echo '{"handled_threads":{},"in_progress":{}}' > "$REVIEW_STATE_FILE"
+[ -f "$REVIEW_STATE_FILE" ] || echo '{"handled_threads":{},"in_progress":{},"review_wait":{},"handled_ci":{}}' > "$REVIEW_STATE_FILE"
 
 # Ensure all keys exist
 for KEY in notified_main_prs merged_prs created_dev_main_prs; do
@@ -78,7 +97,7 @@ for KEY in notified_main_prs merged_prs created_dev_main_prs; do
         jq ". + {\"$KEY\":{}}" "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
     fi
 done
-for KEY in handled_threads in_progress handled_ci; do
+for KEY in handled_threads in_progress handled_ci review_wait; do
     if ! jq -e ".$KEY" "$REVIEW_STATE_FILE" >/dev/null 2>&1; then
         jq ". + {\"$KEY\":{}}" "$REVIEW_STATE_FILE" > "${REVIEW_STATE_FILE}.tmp" && mv "${REVIEW_STATE_FILE}.tmp" "$REVIEW_STATE_FILE"
     fi
@@ -398,8 +417,10 @@ if [ "$UNRESOLVED_COUNT" -gt 0 ]; then
         PR_REPO=$(echo "$PR_JSON" | jq -r '.repo')
         PR_NUM=$(echo "$PR_JSON" | jq -r '.number')
         PR_HEAD=$(echo "$PR_JSON" | jq -r '.head')
+        PR_HEAD_SHA=$(echo "$PR_JSON" | jq -r '.head_sha // ""')
         PR_KEY="${PR_REPO}#${PR_NUM}"
         THREAD_COUNT=$(echo "$PR_JSON" | jq '.unresolved_threads | length')
+        NOW_ISO=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
         # Check if already in progress (30 min cooldown)
         IN_PROGRESS_TS=$(jq -r ".in_progress[\"$PR_KEY\"] // \"\"" "$REVIEW_STATE_FILE")
@@ -408,7 +429,37 @@ if [ "$UNRESOLVED_COUNT" -gt 0 ]; then
             continue
         fi
 
-        echo "$LOG_PREFIX   🔍 Spawning review handler for $PR_KEY ($THREAD_COUNT thread(s))..."
+        WAIT_FIRST_SEEN=$(jq -r ".review_wait[\"$PR_KEY\"].first_seen // \"\"" "$REVIEW_STATE_FILE")
+        WAIT_HEAD_SHA=$(jq -r ".review_wait[\"$PR_KEY\"].head_sha // \"\"" "$REVIEW_STATE_FILE")
+
+        if [ -z "$WAIT_FIRST_SEEN" ] || [ "$WAIT_HEAD_SHA" != "$PR_HEAD_SHA" ]; then
+            jq --arg key "$PR_KEY" --arg ts "$NOW_ISO" --arg sha "$PR_HEAD_SHA" \
+                '.review_wait[$key] = {first_seen: $ts, head_sha: $sha}' "$REVIEW_STATE_FILE" > "${REVIEW_STATE_FILE}.tmp" && \
+                mv "${REVIEW_STATE_FILE}.tmp" "$REVIEW_STATE_FILE"
+            if [ "$REVIEW_WAIT_MINUTES" -eq 0 ]; then
+                echo "$LOG_PREFIX   ⏱️ Review wait window disabled (REVIEW_WAIT_MINUTES=0); will spawn on next pass for $PR_KEY"
+            else
+                echo "$LOG_PREFIX   ⏱️ Starting ${REVIEW_WAIT_MINUTES}m review window for $PR_KEY at commit ${PR_HEAD_SHA:0:12} ($THREAD_COUNT thread(s))"
+            fi
+            continue
+        fi
+
+        if [ "$REVIEW_WAIT_MINUTES" -eq 0 ]; then
+            # Wait window disabled: skip cutoff check, spawn immediately.
+            :
+        else
+            CUTOFF_WAIT=$(date -u -d "${REVIEW_WAIT_MINUTES} minutes ago" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)
+            if [ -z "$CUTOFF_WAIT" ]; then
+                echo "$LOG_PREFIX   ⚠️ 'date -d' failed (non-GNU date?), disabling review wait window for this check"
+                CUTOFF_WAIT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+            fi
+            if [[ "$WAIT_FIRST_SEEN" > "$CUTOFF_WAIT" ]]; then
+                echo "$LOG_PREFIX   ⏳ $PR_KEY still inside ${REVIEW_WAIT_MINUTES}m review window (since $WAIT_FIRST_SEEN), waiting"
+                continue
+            fi
+        fi
+
+        echo "$LOG_PREFIX   🔍 Review window elapsed, spawning handler for $PR_KEY ($THREAD_COUNT thread(s))..."
 
         # Write per-PR thread data
         PR_THREAD_FILE="/tmp/pr-review-${PR_REPO//\//-}-${PR_NUM}.json"
@@ -421,8 +472,11 @@ if [ "$UNRESOLVED_COUNT" -gt 0 ]; then
         # Determine test command (auto-detect from project type)
         TEST_CMD="$(_detect_test_cmd "$LOCAL_PATH")"
 
-        # Mark in progress
-        jq --arg key "$PR_KEY" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        # Mark in_progress before scheduling so overlapping manager runs do not double-spawn.
+        # Keep the review_wait baseline intact until we know the spawn succeeded — on failure
+        # we only clear in_progress, so the next pass retries against the original baseline
+        # instead of starting a fresh wait window.
+        jq --arg key "$PR_KEY" --arg ts "$NOW_ISO" \
             '.in_progress[$key] = $ts' "$REVIEW_STATE_FILE" > "${REVIEW_STATE_FILE}.tmp" && \
             mv "${REVIEW_STATE_FILE}.tmp" "$REVIEW_STATE_FILE"
 
@@ -477,10 +531,18 @@ Clear the in-progress marker:
 - DO NOT claim the PR is 'ready' — only report which threads you handled." \
             2>/dev/null || {
                 echo "$LOG_PREFIX     ⚠️ Failed to spawn review handler for $PR_KEY"
-                # Clear in_progress on spawn failure
+                # Clear in_progress on spawn failure; preserve review_wait baseline so the
+                # next manager pass retries without starting a fresh wait window.
                 jq --arg key "$PR_KEY" 'del(.in_progress[$key])' "$REVIEW_STATE_FILE" > "${REVIEW_STATE_FILE}.tmp" && \
                     mv "${REVIEW_STATE_FILE}.tmp" "$REVIEW_STATE_FILE"
+                continue
             }
+
+        # Spawn succeeded — now clear the baseline so a future round of reviews
+        # starts a fresh wait window from first observation.
+        jq --arg key "$PR_KEY" \
+            'del(.review_wait[$key])' "$REVIEW_STATE_FILE" > "${REVIEW_STATE_FILE}.tmp" && \
+            mv "${REVIEW_STATE_FILE}.tmp" "$REVIEW_STATE_FILE"
 
         echo "$LOG_PREFIX   ✅ Review handler spawned for $PR_KEY"
     done
@@ -500,6 +562,7 @@ CUTOFF_7D=$(date -u -d "7 days ago" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +
 jq --arg cutoff "$CUTOFF_7D" '
   .handled_threads = (.handled_threads // {} | to_entries | map(select(.value > $cutoff)) | from_entries)
   | .handled_ci = (.handled_ci // {} | to_entries | map(select(.value > $cutoff)) | from_entries)
+  | .review_wait = (.review_wait // {} | to_entries | map(select((.value.first_seen // "") > $cutoff)) | from_entries)
 ' "$REVIEW_STATE_FILE" > "${REVIEW_STATE_FILE}.tmp" 2>/dev/null && mv "${REVIEW_STATE_FILE}.tmp" "$REVIEW_STATE_FILE" || true
 
 # ─── Clean up old temp files (>1 day) ───
