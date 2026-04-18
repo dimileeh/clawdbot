@@ -7,7 +7,7 @@
 #
 #   1. If a PR is mergeable + CI green + 0 unresolved threads:
 #      a. target development → auto squash-merge (unless a dev→main PR is open).
-#      b. target main → notify Dmitri once per commit SHA.
+#      b. target main → notify the maintainer once per commit SHA.
 #
 #   2. If a PR has unresolved review threads AND the per-PR "review wait"
 #      window (default 15 min since the last check of that SHA) has elapsed:
@@ -247,7 +247,7 @@ for REPO in $REPOS; do
             # ─── Classify the PR ─────────────────────────────────────────
             # Five terminal states (or skip/continue):
             #   READY_DEV      → auto-merge
-            #   READY_MAIN     → notify Dmitri
+            #   READY_MAIN     → notify the maintainer
             #   HAS_COMMENTS   → notify Sparky (after wait)
             #   CI_FAILED      → notify Sparky
             #   NOT_READY      → waiting (pending CI, conflicts, drafts,
@@ -301,7 +301,7 @@ for REPO in $REPOS; do
                 READY_MAIN)
                     NOTIFIED_SHA=$(jq -r ".notified_main_prs[\"$PR_KEY\"] // \"\"" "$STATE_FILE")
                     if [ "$NOTIFIED_SHA" = "$COMMIT_SHA" ]; then
-                        echo "$LOG_PREFIX     Already notified Dmitri at this SHA"
+                        echo "$LOG_PREFIX     Already notified the maintainer at this SHA"
                         continue
                     fi
                     MERGE_REASONS="${MERGE_REASONS}🟢 $PR_KEY ready to merge to main: $PR_TITLE\n   All comments resolved, checks green, mergeable.\n   $PR_URL\n"
