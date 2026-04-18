@@ -393,22 +393,58 @@ done
 UNRESOLVED_PRS=$(bash "$HOME/.clawdbot/pr-review-collector.sh" 2>/dev/null || echo "[]")
 UNRESOLVED_COUNT=$(echo "$UNRESOLVED_PRS" | jq 'length' 2>/dev/null || echo "0")
 
-NOW_EPOCH=$(date +%s)
-# Clean up stale in_progress entries (>30 min old)
-jq --argjson now "$NOW_EPOCH" '
-  .in_progress = (.in_progress // {} | to_entries | map(
-    select((.value | split("T")[0] + "T" + .value | split("T")[1]) as $ts |
-      ($now - (now | floor)) < 1800)
-  ) | from_entries)
-' "$REVIEW_STATE_FILE" > "${REVIEW_STATE_FILE}.tmp" 2>/dev/null && \
-  mv "${REVIEW_STATE_FILE}.tmp" "$REVIEW_STATE_FILE" || true
+# ─── Stale in_progress cleanup ──────────────────────────────────────────────
+#
+# A review / CI-fix handler records an ISO timestamp in
+# ``pr-review-handler-state.json -> in_progress[<PR_KEY>]`` when it is
+# spawned, and is expected to delete that entry as part of its own teardown.
+# If the handler crashes, times out, or its cron run record never lands,
+# that entry is leaked and the next pr-manager tick silently refuses to
+# re-spawn for the same PR ("already has review handler in progress,
+# skipping") — forever.
+#
+# Prune any marker older than STALE_IN_PROGRESS_MINUTES (default 30) so a
+# dead handler cannot permanently block its PR. The threshold must be
+# strictly greater than the handler's own timeout
+# (--timeout-seconds 1200 = 20 min today) so we never race a handler that is
+# still legitimately running. When an entry is evicted we log the fact so
+# the next diagnostic pass can tell "handler crashed" from "handler never
+# acquired the marker in the first place".
+STALE_IN_PROGRESS_MINUTES="${CLAWDBOT_STALE_IN_PROGRESS_MINUTES:-30}"
+if ! [[ "$STALE_IN_PROGRESS_MINUTES" =~ ^[0-9]+$ ]] || [ "$STALE_IN_PROGRESS_MINUTES" -lt 1 ]; then
+    echo "$LOG_PREFIX ⚠️ Invalid CLAWDBOT_STALE_IN_PROGRESS_MINUTES='$STALE_IN_PROGRESS_MINUTES' (must be positive integer); using default 30" >&2
+    STALE_IN_PROGRESS_MINUTES=30
+fi
 
-# Actually, simpler stale cleanup — parse ISO timestamps
-CUTOFF_30M=$(date -u -d "30 minutes ago" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)
-jq --arg cutoff "$CUTOFF_30M" '
-  .in_progress = (.in_progress // {} | to_entries | map(select(.value > $cutoff)) | from_entries)
-' "$REVIEW_STATE_FILE" > "${REVIEW_STATE_FILE}.tmp" 2>/dev/null && \
-  mv "${REVIEW_STATE_FILE}.tmp" "$REVIEW_STATE_FILE" || true
+STALE_CUTOFF_ISO=$(date -u -d "${STALE_IN_PROGRESS_MINUTES} minutes ago" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)
+if [ -z "$STALE_CUTOFF_ISO" ]; then
+    echo "$LOG_PREFIX ⚠️ 'date -d' failed (non-GNU date?); skipping stale in_progress cleanup this tick" >&2
+else
+    STALE_EVICTED=$(jq -r --arg cutoff "$STALE_CUTOFF_ISO" '
+      .in_progress // {} | to_entries
+        | map(select(.value <= $cutoff))
+        | map("\(.key)@\(.value)")
+        | join(",")
+    ' "$REVIEW_STATE_FILE" 2>/dev/null || true)
+
+    if [ -n "$STALE_EVICTED" ] && [ "$STALE_EVICTED" != "null" ]; then
+        echo "$LOG_PREFIX 🧹 Evicting stale in_progress marker(s) older than ${STALE_IN_PROGRESS_MINUTES}m: $STALE_EVICTED"
+    fi
+
+    if ! jq --arg cutoff "$STALE_CUTOFF_ISO" '
+      .in_progress = (
+        .in_progress // {}
+          | to_entries
+          | map(select(.value > $cutoff))
+          | from_entries
+      )
+    ' "$REVIEW_STATE_FILE" > "${REVIEW_STATE_FILE}.tmp" 2>&1; then
+        echo "$LOG_PREFIX ⚠️ Stale in_progress cleanup failed; leaving state file untouched" >&2
+        rm -f "${REVIEW_STATE_FILE}.tmp"
+    else
+        mv "${REVIEW_STATE_FILE}.tmp" "$REVIEW_STATE_FILE"
+    fi
+fi
 
 if [ "$UNRESOLVED_COUNT" -gt 0 ]; then
     # Process each PR individually

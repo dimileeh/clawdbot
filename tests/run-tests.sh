@@ -233,6 +233,83 @@ else
     fail "_detect_test_cmd returns fallback for unknown project (got: $result)"
 fi
 
+# ─── Stale in_progress pruning (pr-manager.sh) ───────────────────────────────
+#
+# Simulate the jq filter used by the stale-in_progress cleanup in
+# pr-manager.sh: given a cutoff ISO timestamp, any in_progress entry with
+# ``value <= cutoff`` must be evicted, and any entry with ``value > cutoff``
+# must be preserved. This guards the behaviour end-to-end without having to
+# boot the full pr-manager run.
+STALE_STATE="$TEST_TMP/state.json"
+cat > "$STALE_STATE" <<'EOF'
+{
+  "handled_threads": {},
+  "in_progress": {
+    "dimileeh/aira-agent#100": "2026-04-18T10:00:00Z",
+    "dimileeh/aira-agent#200": "2026-04-18T12:45:00Z",
+    "dimileeh/aira-agent#300": "2026-04-18T12:59:59Z"
+  },
+  "handled_ci": {},
+  "review_wait": {}
+}
+EOF
+CUTOFF="2026-04-18T12:30:00Z"  # 30 minutes before 13:00 UTC
+PRUNED=$(jq -r --arg cutoff "$CUTOFF" '
+  .in_progress // {} | to_entries
+    | map(select(.value <= $cutoff))
+    | map(.key) | sort | join(",")
+' "$STALE_STATE")
+if [ "$PRUNED" = "dimileeh/aira-agent#100" ]; then
+    pass "stale in_progress cleanup evicts only entries older than cutoff"
+else
+    fail "stale in_progress cleanup evicts only entries older than cutoff (got: $PRUNED)"
+fi
+
+KEPT=$(jq -r --arg cutoff "$CUTOFF" '
+  .in_progress // {} | to_entries
+    | map(select(.value > $cutoff))
+    | map(.key) | sort | join(",")
+' "$STALE_STATE")
+if [ "$KEPT" = "dimileeh/aira-agent#200,dimileeh/aira-agent#300" ]; then
+    pass "stale in_progress cleanup preserves fresh entries"
+else
+    fail "stale in_progress cleanup preserves fresh entries (got: $KEPT)"
+fi
+
+# Edge case: entry timestamp equal to the cutoff is treated as stale (<=).
+BOUNDARY_STATE="$TEST_TMP/boundary.json"
+cat > "$BOUNDARY_STATE" <<EOF
+{"in_progress": {"pr@cutoff": "$CUTOFF"}}
+EOF
+BOUNDARY_PRUNED=$(jq -r --arg cutoff "$CUTOFF" '
+  .in_progress // {} | to_entries
+    | map(select(.value <= $cutoff))
+    | map(.key) | join(",")
+' "$BOUNDARY_STATE")
+if [ "$BOUNDARY_PRUNED" = "pr@cutoff" ]; then
+    pass "stale in_progress cleanup prunes entry exactly at the cutoff"
+else
+    fail "stale in_progress cleanup prunes entry exactly at the cutoff (got: $BOUNDARY_PRUNED)"
+fi
+
+# Invalid CLAWDBOT_STALE_IN_PROGRESS_MINUTES falls back to default 30 with a
+# warning. This is a smoke test of the validation regex used in the script.
+for bad_value in "" "abc" "-5" "5.5"; do
+    if [[ "$bad_value" =~ ^[0-9]+$ ]] && [ "$bad_value" -ge 1 ] 2>/dev/null; then
+        fail "stale-minutes validator accepted bad value '$bad_value'"
+    else
+        pass "stale-minutes validator rejects '$bad_value'"
+    fi
+done
+
+for good_value in "1" "30" "60" "3600"; do
+    if [[ "$good_value" =~ ^[0-9]+$ ]] && [ "$good_value" -ge 1 ] 2>/dev/null; then
+        pass "stale-minutes validator accepts '$good_value'"
+    else
+        fail "stale-minutes validator rejected good value '$good_value'"
+    fi
+done
+
 rm -rf "$TEST_TMP"
 echo ""
 
