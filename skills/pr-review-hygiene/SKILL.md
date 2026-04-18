@@ -13,7 +13,7 @@ You hold business context, memory, and the authority to decide *which* findings 
 
 ## The loop
 
-```
+```text
   pr-manager wake
         ↓
   Triage (aggregate → plan → post plan to chat)
@@ -41,7 +41,7 @@ When a `review_comments` or `ci_failed` envelope arrives:
 2. **Aggregate by theme + severity.** Don't just walk the list top-to-bottom. Look for patterns (three comments about the same function, two that contradict each other).
 3. **Post a short plan in chat** before you start editing. Humans get to course-correct cheap here. Format:
 
-   ```
+   ```text
    PR #N — M threads.
 
    Fixing (k):
@@ -92,23 +92,71 @@ sleep 30
 gh pr view <N> --json headRefOid,mergeable,mergeStateStatus
 
 # Check for unresolved threads (including freshly-added ones).
-gh api graphql -f query='
-{
-  repository(owner:"OWNER", name:"REPO") {
-    pullRequest(number: <N>) {
-      reviewThreads(first:100) {
-        nodes {
-          id
-          isResolved
-          comments(first:1) { nodes { databaseId author{login} path line body } }
+#
+# Why ``isOutdated``: when you push a fix, every comment that anchored
+# to a line your fix touched becomes ``isOutdated: true`` but stays
+# ``isResolved: false`` until you explicitly resolve it. If you treat
+# "any unresolved" as "new findings to triage," you'll loop back to
+# Step 1 forever on your own resolved-but-not-yet-marked threads.
+# Filter to ``isOutdated == false`` to detect *fresh* findings only.
+#
+# Why ``comments(last:20)``: review bots sometimes post follow-up
+# comments on an existing thread instead of opening a new one. Grab
+# enough tail to see recent bot activity, not just the original
+# comment. (20 is generous — most threads stay under 5.)
+#
+# Why GraphQL variables: string-interpolating the PR number, owner,
+# and repo into the query body is fragile; the ``-F`` / ``-f`` flag
+# form is safer and works the same for all callers.
+#
+# Why pagination: ``reviewThreads(first:100)`` caps at 100. A PR with
+# more than 100 threads would silently drop the tail and Step 4 would
+# report "clean" while unresolved threads hid beyond the cursor.
+# Loop on ``pageInfo.hasNextPage`` + ``endCursor`` until exhausted.
+
+OWNER="..."; REPO="..."; PR=<N>
+cursor="null"
+threads="[]"
+while : ; do
+  page=$(gh api graphql \
+    -f query='
+      query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
+        repository(owner: $owner, name: $repo) {
+          pullRequest(number: $number) {
+            reviewThreads(first: 100, after: $cursor) {
+              pageInfo { hasNextPage endCursor }
+              nodes {
+                id
+                isResolved
+                isOutdated
+                comments(last: 20) {
+                  nodes { databaseId author { login } path line body }
+                }
+              }
+            }
+          }
         }
-      }
-    }
-  }
-}' --jq '.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false)'
+      }' \
+    -f owner="$OWNER" -f repo="$REPO" -F number="$PR" \
+    $( [ "$cursor" = "null" ] || echo -f cursor="$cursor" ))
+  threads=$(jq -n --argjson acc "$threads" --argjson page "$page" \
+    '$acc + $page.data.repository.pullRequest.reviewThreads.nodes')
+  has_next=$(echo "$page" | jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.hasNextPage')
+  [ "$has_next" = "true" ] || break
+  cursor=$(echo "$page" | jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.endCursor')
+done
+
+# Fresh findings (non-outdated, non-resolved) → go back to Step 1.
+# Outdated-but-not-resolved → proceed to Step 5 (reply + resolve).
+fresh=$(echo "$threads" | jq '[.[] | select(.isResolved == false and .isOutdated == false)]')
+addressed=$(echo "$threads" | jq '[.[] | select(.isResolved == false and .isOutdated == true)]')
 ```
 
-If unresolved threads exist, go back to **Step 1** in the same turn. **Do not wait for the next `pr-manager` wake** — the debounce window (default 15 min) exists to let review bots converge, not to let you ignore live findings.
+**Decision rule:**
+
+- `fresh` non-empty → **go back to Step 1** in the same turn with the new findings. Do not wait for the next `pr-manager` wake; the debounce (default 15 min) exists to let review bots converge, not to let you ignore live findings.
+- `fresh` empty but `addressed` non-empty → proceed to Step 5 and reply + resolve each addressed thread.
+- Both empty → PR is clean; proceed to Step 6.
 
 Pre-fix-era failure mode this rule prevents: *"I pushed c21941, Cursor posted a follow-up finding 15 seconds later, I declared the PR clean, and the human saw the unresolved thread on GitHub before pr-manager's timer fired 14 minutes later."* Don't do that.
 
@@ -121,6 +169,32 @@ Every resolved thread must have a reply from you first. The reply should include
 - What tests now pin it (if any were added)
 - Test status (e.g., "189/189 Slack tests passing, ruff + mypy clean")
 
+Two options for posting the reply; both work, pick whichever is cleanest for your script. **Always resolve *after* the reply succeeded** — never the reverse.
+
+**Option A: GraphQL (recommended).** Single API, uses the thread id you already have from Step 4.
+
+```bash
+# 1. Reply on the thread.
+gh api graphql -f query='
+  mutation($threadId: ID!, $body: String!) {
+    addPullRequestReviewThreadReply(
+      input: {pullRequestReviewThreadId: $threadId, body: $body}
+    ) {
+      comment { id }
+    }
+  }' -f threadId="<THREAD_ID>" -f body="<REPLY_TEXT>"
+
+# 2. Resolve the thread.
+gh api graphql -f query='
+  mutation($threadId: ID!) {
+    resolveReviewThread(input: {threadId: $threadId}) {
+      thread { id isResolved }
+    }
+  }' -f threadId="<THREAD_ID>"
+```
+
+**Option B: REST reply + GraphQL resolve.** Same effect; the REST path needs the numeric comment id rather than the thread node id.
+
 **Never guess the parent comment id.** The reply REST endpoint
 (`POST /repos/OWNER/REPO/pulls/NUM/comments/COMMENT_ID/replies`)
 needs the *first* comment's numeric `databaseId` on the thread, not
@@ -129,26 +203,33 @@ re-fetch it from the same GraphQL query that gave you the unresolved
 list in Step 4:
 
 ```bash
-gh api graphql -f query='{ repository(owner:"OWNER", name:"REPO") { pullRequest(number:NUM) { reviewThreads(first:100) { nodes { id comments(first:1) { nodes { databaseId } } } } } } }' \
+gh api graphql -f query='
+  query($owner: String!, $repo: String!, $number: Int!) {
+    repository(owner: $owner, name: $repo) {
+      pullRequest(number: $number) {
+        reviewThreads(first:100) {
+          nodes { id comments(first:1) { nodes { databaseId } } }
+        }
+      }
+    }
+  }' -f owner="OWNER" -f repo="REPO" -F number=<N> \
   --jq '.data.repository.pullRequest.reviewThreads.nodes[] | select(.id == "<THREAD_ID>") | .comments.nodes[0].databaseId'
 ```
 
 Then:
 
 ```bash
+# Reply via REST (needs the numeric comment id from the query above).
 gh api "repos/OWNER/REPO/pulls/NUM/comments/<COMMENT_ID>/replies" \
-  -X POST -f body="...your reply..."
-```
+  -X POST -f body="<REPLY_TEXT>"
 
-Review-bot threads get resolved via GraphQL:
-
-```bash
+# Resolve via GraphQL (needs the thread node id).
 gh api graphql -f query='
   mutation($threadId: ID!) {
     resolveReviewThread(input: {threadId: $threadId}) {
       thread { id isResolved }
     }
-  }' -F threadId="<THREAD_ID>"
+  }' -f threadId="<THREAD_ID>"
 ```
 
 The thread ID comes from the GraphQL query in Step 4.
