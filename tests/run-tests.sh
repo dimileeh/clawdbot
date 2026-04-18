@@ -342,6 +342,39 @@ else
 fi
 echo ""
 
+# ─── Layer 5f: READY_DEV hold is log-only, not wake-triggering ───────
+echo "Layer 5f: READY_DEV hold is log-only"
+#
+# Invariant: when a READY_DEV PR is held back because an open dev→main
+# PR already exists, pr-manager MUST NOT append that hold to
+# MERGE_REASONS. MERGE_REASONS drives the end-of-run ``_wake_sparky``
+# call, and the hold state is the same every tick until the blocker PR
+# closes — so waking the orchestrator every 5 minutes with the same
+# message is pure noise. The operator can still see the hold in the
+# crontab-captured stdout log.
+
+ready_dev_body=$(awk '/^                READY_DEV\)$/,/^                    ;;$/' "$REPO_DIR/pr-manager.sh")
+if echo "$ready_dev_body" | grep -q 'HAS_OPEN_DEV_MAIN'; then
+    pass "READY_DEV still guards against open dev→main PR"
+else
+    fail "READY_DEV lost its HAS_OPEN_DEV_MAIN guard"
+fi
+
+# The specific contract: inside the HAS_OPEN_DEV_MAIN>0 branch, there
+# must be an echo (log) but no MERGE_REASONS append.
+hold_branch=$(echo "$ready_dev_body" | awk '/HAS_OPEN_DEV_MAIN.*-gt 0/,/fi$/')
+if echo "$hold_branch" | grep -q 'echo.*Holding'; then
+    pass "READY_DEV hold still logs the event"
+else
+    fail "READY_DEV hold stopped logging"
+fi
+if echo "$hold_branch" | grep -q 'MERGE_REASONS.*Holding'; then
+    fail "READY_DEV hold still appends to MERGE_REASONS (would re-wake orchestrator every tick)"
+else
+    pass "READY_DEV hold does NOT append to MERGE_REASONS (log-only)"
+fi
+echo ""
+
 # ─── Layer 5e: notified_main_prs wake-gating ──────────────────────
 echo "Layer 5e: notified_main_prs wake-gating"
 #
