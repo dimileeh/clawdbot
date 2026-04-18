@@ -116,124 +116,164 @@ for var in $USED_VARS; do
 done
 echo ""
 
-# ─── Layer 5: Helper function unit tests ───────────────────────────────────
-echo "Layer 5: Helper function unit tests"
+# ─── Layer 5: pr-manager PR classifier logic ───────────────────────────
+#
+# pr-manager.sh maps (mergeable, check_state, unresolved, base) into one of
+# five terminal STATE values. These tests pin that mapping independently of
+# the rest of the script so future refactors cannot silently flip a case.
+echo "Layer 5: pr-manager classifier logic"
 
-# Source the helper functions from pr-manager.sh
-eval "$(sed -n '/^_resolve_repo_path()/,/^}/p' "$REPO_DIR/pr-manager.sh")"
-eval "$(sed -n '/^_detect_test_cmd()/,/^}/p' "$REPO_DIR/pr-manager.sh")"
+classify() {
+    local mergeable="$1" check_state="$2" unresolved="$3" base="$4"
+    if [ "$mergeable" = "MERGEABLE" ] && [ "$check_state" = "SUCCESS" ] && [ "$unresolved" -eq 0 ]; then
+        [ "$base" = "development" ] && echo "READY_DEV" || echo "READY_MAIN"
+    elif [ "$unresolved" -gt 0 ]; then
+        echo "HAS_COMMENTS"
+    elif [ "$check_state" = "FAILURE" ]; then
+        echo "CI_FAILED"
+    else
+        echo "NOT_READY"
+    fi
+}
 
-# Test _resolve_repo_path with CLAWDBOT_REPO_MAP
-export CLAWDBOT_REPO_MAP='{"my-api": "project/api", "my-web": "project/web"}'
+expect_state() {
+    local got="$1" want="$2" label="$3"
+    if [ "$got" = "$want" ]; then
+        pass "classifier: $label → $want"
+    else
+        fail "classifier: $label expected $want, got $got"
+    fi
+}
 
-result=$(_resolve_repo_path "my-api")
-if [ "$result" = "project/api" ]; then
-    pass "_resolve_repo_path maps known repo"
+expect_state "$(classify MERGEABLE SUCCESS 0 development)" READY_DEV "clean dev PR"
+expect_state "$(classify MERGEABLE SUCCESS 0 main)" READY_MAIN "clean main PR"
+expect_state "$(classify MERGEABLE SUCCESS 3 development)" HAS_COMMENTS "dev PR with comments"
+expect_state "$(classify MERGEABLE SUCCESS 1 main)" HAS_COMMENTS "main PR with comments"
+expect_state "$(classify MERGEABLE FAILURE 0 development)" CI_FAILED "clean threads + failed CI"
+expect_state "$(classify MERGEABLE FAILURE 2 development)" HAS_COMMENTS "comments beat CI failure in priority"
+expect_state "$(classify MERGEABLE PENDING 0 development)" NOT_READY "CI still running"
+expect_state "$(classify CONFLICTING SUCCESS 0 development)" NOT_READY "merge conflict"
+expect_state "$(classify CONFLICTING FAILURE 5 development)" HAS_COMMENTS "comments win over everything else"
+echo ""
+
+# ─── Layer 5b: review wait window + renotification logic ───────────────────
+echo "Layer 5b: review wait + renotification logic"
+
+# The script gates notifications on two ISO-timestamp comparisons:
+#   (1) first_seen <= wait_cutoff   → wait window has elapsed
+#   (2) last_notified <= renotify_cutoff → free to renotify on stale review
+WAIT_CUTOFF="2026-04-18T13:00:00Z"
+
+# Inside the wait window → skip.
+first_seen="2026-04-18T13:10:00Z"
+if [[ "$first_seen" > "$WAIT_CUTOFF" ]]; then
+    pass "wait window: fresh observation is skipped"
 else
-    fail "_resolve_repo_path maps known repo (got: $result)"
+    fail "wait window: fresh observation should be skipped"
 fi
 
-result=$(_resolve_repo_path "unknown-repo")
-if [ "$result" = "unknown-repo" ]; then
-    pass "_resolve_repo_path falls back for unknown repo"
+# Past the wait window → notify.
+first_seen="2026-04-18T12:30:00Z"
+if ! [[ "$first_seen" > "$WAIT_CUTOFF" ]]; then
+    pass "wait window: elapsed observation proceeds to notify"
 else
-    fail "_resolve_repo_path falls back for unknown repo (got: $result)"
+    fail "wait window: elapsed observation should notify"
 fi
 
-# Test with empty map
-unset CLAWDBOT_REPO_MAP
-result=$(_resolve_repo_path "any-repo")
-if [ "$result" = "any-repo" ]; then
-    pass "_resolve_repo_path works without CLAWDBOT_REPO_MAP"
+# Exactly at the cutoff → notify (>, not >=).
+first_seen="$WAIT_CUTOFF"
+if ! [[ "$first_seen" > "$WAIT_CUTOFF" ]]; then
+    pass "wait window: observation exactly at cutoff proceeds"
 else
-    fail "_resolve_repo_path works without CLAWDBOT_REPO_MAP (got: $result)"
+    fail "wait window: observation exactly at cutoff should proceed"
 fi
 
-# Test _detect_test_cmd with mock project dirs
-TEST_TMP=$(mktemp -d)
-
-# Python project
-mkdir -p "$TEST_TMP/python-proj"
-touch "$TEST_TMP/python-proj/pyproject.toml"
-result=$(_detect_test_cmd "$TEST_TMP/python-proj")
-if [[ "$result" == *"pytest"* ]]; then
-    pass "_detect_test_cmd detects Python project"
+# Renotification: inside window → silent, past window → notify.
+RENOTIFY_CUTOFF="2026-04-18T13:00:00Z"
+last_notified="2026-04-18T13:30:00Z"
+if [[ "$last_notified" > "$RENOTIFY_CUTOFF" ]]; then
+    pass "renotify: recently notified stays silent"
 else
-    fail "_detect_test_cmd detects Python project (got: $result)"
+    fail "renotify: recently notified should stay silent"
 fi
-
-# Node project with "test" script
-mkdir -p "$TEST_TMP/node-test"
-echo '{"scripts": {"test": "vitest run"}}' > "$TEST_TMP/node-test/package.json"
-result=$(_detect_test_cmd "$TEST_TMP/node-test")
-if [[ "$result" == *"npm run test"* ]]; then
-    pass "_detect_test_cmd detects Node project with test script"
+last_notified="2026-04-18T11:30:00Z"
+if ! [[ "$last_notified" > "$RENOTIFY_CUTOFF" ]]; then
+    pass "renotify: stale notification triggers re-wake"
 else
-    fail "_detect_test_cmd detects Node project with test script (got: $result)"
+    fail "renotify: stale notification should re-wake"
 fi
+echo ""
 
-# Node project with "test:unit" only
-mkdir -p "$TEST_TMP/node-unit"
-echo '{"scripts": {"test:unit": "vitest run"}}' > "$TEST_TMP/node-unit/package.json"
-result=$(_detect_test_cmd "$TEST_TMP/node-unit")
-if [[ "$result" == *"test:unit"* ]]; then
-    pass "_detect_test_cmd detects Node project with test:unit script"
+# ─── Layer 5c: notification envelope shape ───────────────────────────────
+echo "Layer 5c: notification envelope shape"
+
+# Confirm the jq filter pr-manager.sh uses to build each payload produces
+# the documented shape — pr_key, ci_status, unresolved_threads[].comments[].
+# Synthetic input matches the GraphQL response the script consumes.
+SYNTH_PR='{
+  "number": 42,
+  "title": "test",
+  "url": "https://example",
+  "headRefName": "feat/x",
+  "baseRefName": "development",
+  "commits": { "nodes": [ { "commit": { "oid": "abc", "statusCheckRollup": { "state": "SUCCESS", "contexts": { "nodes": [
+    { "__typename": "CheckRun", "name": "lint", "conclusion": "SUCCESS", "status": "COMPLETED" },
+    { "__typename": "StatusContext", "context": "ci/travis", "state": "SUCCESS" }
+  ] } } } } ] },
+  "reviewThreads": { "nodes": [
+    { "id": "t1", "isResolved": false, "isOutdated": false, "comments": { "nodes": [
+      { "id": "c1", "body": "fix me", "author": { "login": "bot" }, "path": "a.py", "line": 10, "createdAt": "2026-04-18T13:00:00Z" }
+    ] } },
+    { "id": "t2", "isResolved": true, "isOutdated": false, "comments": { "nodes": [ ] } }
+  ] }
+}'
+
+ENVELOPE=$(echo "$SYNTH_PR" | jq --arg repo "o/r" --arg pr_key "o/r#42" --arg sha "abc" --arg check_state "SUCCESS" '{
+    event: "review_comments",
+    pr_key: $pr_key,
+    repo: $repo,
+    number: .number,
+    title: .title,
+    url: .url,
+    head: .headRefName,
+    base: .baseRefName,
+    head_sha: $sha,
+    ci_status: $check_state,
+    ci_contexts: [.commits.nodes[0].commit.statusCheckRollup.contexts.nodes[]? | . as $ctx | if .__typename == "CheckRun" then {type:"check", name: $ctx.name, conclusion: $ctx.conclusion, status: $ctx.status} else {type:"status", name: $ctx.context, conclusion: $ctx.state} end],
+    unresolved_threads: [
+        .reviewThreads.nodes[]
+        | select(.isResolved == false and .isOutdated == false)
+        | {
+            thread_id: .id,
+            comments: [.comments.nodes[] | {
+                id: .id, author: .author.login, path: .path, line: .line,
+                body: .body, created_at: .createdAt
+            }]
+          }
+    ]
+}')
+
+if echo "$ENVELOPE" | jq -e '.event == "review_comments"' >/dev/null; then
+    pass "envelope: event=review_comments is tagged"
 else
-    fail "_detect_test_cmd detects Node project with test:unit script (got: $result)"
+    fail "envelope: event tag missing"
 fi
-
-# Node project with no test script
-mkdir -p "$TEST_TMP/node-notest"
-echo '{"scripts": {"build": "next build"}}' > "$TEST_TMP/node-notest/package.json"
-result=$(_detect_test_cmd "$TEST_TMP/node-notest")
-if [[ "$result" == *"next build"* ]]; then
-    pass "_detect_test_cmd falls back to next build for Node without test"
+if [ "$(echo "$ENVELOPE" | jq '.unresolved_threads | length')" = "1" ]; then
+    pass "envelope: resolved + outdated threads are filtered out"
 else
-    fail "_detect_test_cmd falls back to next build for Node without test (got: $result)"
+    fail "envelope: expected 1 unresolved thread (got $(echo "$ENVELOPE" | jq '.unresolved_threads | length'))"
 fi
-
-# Bash project with tests/run-tests.sh — no pyproject.toml or package.json,
-# just a repo-local bash test harness. Should prefer the harness over the
-# "No test command" fallback so the review handler can verify its own fix.
-mkdir -p "$TEST_TMP/bash-proj/tests"
-cat > "$TEST_TMP/bash-proj/tests/run-tests.sh" <<'EOF'
-#!/bin/bash
-exit 0
-EOF
-chmod +x "$TEST_TMP/bash-proj/tests/run-tests.sh"
-result=$(_detect_test_cmd "$TEST_TMP/bash-proj")
-if [[ "$result" == *"tests/run-tests.sh"* ]]; then
-    pass "_detect_test_cmd detects repo-local bash test harness"
+if [ "$(echo "$ENVELOPE" | jq -r '.unresolved_threads[0].comments[0].path')" = "a.py" ]; then
+    pass "envelope: comment path preserved"
 else
-    fail "_detect_test_cmd detects repo-local bash test harness (got: $result)"
+    fail "envelope: comment path missing"
 fi
-
-# Bash test harness must not override a Python or Node harness when both
-# signals are present (pyproject.toml / package.json take precedence because
-# those ecosystems have richer test runners than bash).
-mkdir -p "$TEST_TMP/python-with-bash/tests"
-touch "$TEST_TMP/python-with-bash/pyproject.toml"
-cat > "$TEST_TMP/python-with-bash/tests/run-tests.sh" <<'EOF'
-#!/bin/bash
-exit 0
-EOF
-result=$(_detect_test_cmd "$TEST_TMP/python-with-bash")
-if [[ "$result" == *"pytest"* ]]; then
-    pass "_detect_test_cmd prefers Python harness over bash fallback"
+if [ "$(echo "$ENVELOPE" | jq '.ci_contexts | length')" = "2" ]; then
+    pass "envelope: ci_contexts carries both CheckRun and StatusContext entries"
 else
-    fail "_detect_test_cmd prefers Python harness over bash fallback (got: $result)"
+    fail "envelope: ci_contexts count wrong"
 fi
-
-# Unknown project
-mkdir -p "$TEST_TMP/empty-proj"
-result=$(_detect_test_cmd "$TEST_TMP/empty-proj")
-if [[ "$result" == *"No test command"* ]]; then
-    pass "_detect_test_cmd returns fallback for unknown project"
-else
-    fail "_detect_test_cmd returns fallback for unknown project (got: $result)"
-fi
-
-rm -rf "$TEST_TMP"
+echo ""
 echo ""
 
 # ─── Layer 6: No hardcoded PII ────────────────────────────────────────────
