@@ -438,7 +438,7 @@ else
           | map(select(.value > $cutoff))
           | from_entries
       )
-    ' "$REVIEW_STATE_FILE" > "${REVIEW_STATE_FILE}.tmp" 2>&1; then
+    ' "$REVIEW_STATE_FILE" > "${REVIEW_STATE_FILE}.tmp"; then
         echo "$LOG_PREFIX ⚠️ Stale in_progress cleanup failed; leaving state file untouched" >&2
         rm -f "${REVIEW_STATE_FILE}.tmp"
     else
