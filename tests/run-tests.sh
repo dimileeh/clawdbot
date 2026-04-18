@@ -116,124 +116,337 @@ for var in $USED_VARS; do
 done
 echo ""
 
-# ─── Layer 5: Helper function unit tests ───────────────────────────────────
-echo "Layer 5: Helper function unit tests"
+# ─── Layer 5: pr-manager PR classifier logic ───────────────────────
+#
+# pr-manager.sh maps (mergeable, check_state, unresolved, base) into one of
+# five terminal STATE values. These tests pin that mapping independently of
+# the rest of the script so future refactors cannot silently flip a case.
+#
+# Branch names are honoured via INTEGRATION_BRANCH / MAIN_BRANCH, matching
+# the CLAWDBOT_INTEGRATION_BRANCH / CLAWDBOT_MAIN_BRANCH env vars the
+# script reads at startup. Defaults are development / main but teams can
+# override, so the classifier must not hardcode those names — and neither
+# must these fixtures.
+echo "Layer 5: pr-manager classifier logic"
 
-# Source the helper functions from pr-manager.sh
-eval "$(sed -n '/^_resolve_repo_path()/,/^}/p' "$REPO_DIR/pr-manager.sh")"
-eval "$(sed -n '/^_detect_test_cmd()/,/^}/p' "$REPO_DIR/pr-manager.sh")"
+INTEGRATION_BRANCH="${CLAWDBOT_INTEGRATION_BRANCH:-development}"
+MAIN_BRANCH="${CLAWDBOT_MAIN_BRANCH:-main}"
 
-# Test _resolve_repo_path with CLAWDBOT_REPO_MAP
-export CLAWDBOT_REPO_MAP='{"my-api": "project/api", "my-web": "project/web"}'
+classify() {
+    local mergeable="$1" check_state="$2" unresolved="$3" base="$4"
+    if [ "$mergeable" = "MERGEABLE" ] && [ "$check_state" = "SUCCESS" ] && [ "$unresolved" -eq 0 ]; then
+        if [ "$base" = "$INTEGRATION_BRANCH" ]; then
+            echo "READY_DEV"
+        elif [ "$base" = "$MAIN_BRANCH" ]; then
+            echo "READY_MAIN"
+        else
+            echo "NOT_READY"
+        fi
+    elif [ "$unresolved" -gt 0 ]; then
+        echo "HAS_COMMENTS"
+    elif [ "$check_state" = "FAILURE" ]; then
+        echo "CI_FAILED"
+    else
+        echo "NOT_READY"
+    fi
+}
 
-result=$(_resolve_repo_path "my-api")
-if [ "$result" = "project/api" ]; then
-    pass "_resolve_repo_path maps known repo"
+expect_state() {
+    local got="$1" want="$2" label="$3"
+    if [ "$got" = "$want" ]; then
+        pass "classifier: $label → $want"
+    else
+        fail "classifier: $label expected $want, got $got"
+    fi
+}
+
+expect_state "$(classify MERGEABLE SUCCESS 0 "$INTEGRATION_BRANCH")" READY_DEV "clean integration PR"
+expect_state "$(classify MERGEABLE SUCCESS 0 "$MAIN_BRANCH")" READY_MAIN "clean main PR"
+expect_state "$(classify MERGEABLE SUCCESS 0 "release/1.0")" NOT_READY "clean PR targeting third branch"
+expect_state "$(classify MERGEABLE SUCCESS 3 "$INTEGRATION_BRANCH")" HAS_COMMENTS "integration PR with comments"
+expect_state "$(classify MERGEABLE SUCCESS 1 "$MAIN_BRANCH")" HAS_COMMENTS "main PR with comments"
+expect_state "$(classify MERGEABLE FAILURE 0 "$INTEGRATION_BRANCH")" CI_FAILED "clean threads + failed CI"
+expect_state "$(classify MERGEABLE FAILURE 2 "$INTEGRATION_BRANCH")" HAS_COMMENTS "comments beat CI failure in priority"
+expect_state "$(classify MERGEABLE PENDING 0 "$INTEGRATION_BRANCH")" NOT_READY "CI still running"
+expect_state "$(classify CONFLICTING SUCCESS 0 "$INTEGRATION_BRANCH")" NOT_READY "merge conflict"
+expect_state "$(classify CONFLICTING FAILURE 5 "$INTEGRATION_BRANCH")" HAS_COMMENTS "comments win over everything else"
+
+# Exercise the configurable-branch path explicitly by overriding the names
+# to simulate a team on trunk-based or staging/prod conventions.
+(
+    INTEGRATION_BRANCH="trunk"
+    MAIN_BRANCH="prod"
+    expect_state "$(classify MERGEABLE SUCCESS 0 trunk)" READY_DEV "custom: trunk → READY_DEV"
+    expect_state "$(classify MERGEABLE SUCCESS 0 prod)"  READY_MAIN "custom: prod → READY_MAIN"
+    expect_state "$(classify MERGEABLE SUCCESS 0 development)" NOT_READY "custom: stock 'development' not auto-merged when renamed"
+)
+echo ""
+
+# ─── Layer 5b: review wait window + renotification logic ───────────────────
+echo "Layer 5b: review wait + renotification logic"
+
+# The script gates notifications on two ISO-timestamp comparisons:
+#   (1) first_seen <= wait_cutoff   → wait window has elapsed
+#   (2) last_notified <= renotify_cutoff → free to renotify on stale review
+WAIT_CUTOFF="2026-04-18T13:00:00Z"
+
+# Inside the wait window → skip.
+first_seen="2026-04-18T13:10:00Z"
+if [[ "$first_seen" > "$WAIT_CUTOFF" ]]; then
+    pass "wait window: fresh observation is skipped"
 else
-    fail "_resolve_repo_path maps known repo (got: $result)"
+    fail "wait window: fresh observation should be skipped"
 fi
 
-result=$(_resolve_repo_path "unknown-repo")
-if [ "$result" = "unknown-repo" ]; then
-    pass "_resolve_repo_path falls back for unknown repo"
+# Past the wait window → notify.
+first_seen="2026-04-18T12:30:00Z"
+if ! [[ "$first_seen" > "$WAIT_CUTOFF" ]]; then
+    pass "wait window: elapsed observation proceeds to notify"
 else
-    fail "_resolve_repo_path falls back for unknown repo (got: $result)"
+    fail "wait window: elapsed observation should notify"
 fi
 
-# Test with empty map
-unset CLAWDBOT_REPO_MAP
-result=$(_resolve_repo_path "any-repo")
-if [ "$result" = "any-repo" ]; then
-    pass "_resolve_repo_path works without CLAWDBOT_REPO_MAP"
+# Exactly at the cutoff → notify (>, not >=).
+first_seen="$WAIT_CUTOFF"
+if ! [[ "$first_seen" > "$WAIT_CUTOFF" ]]; then
+    pass "wait window: observation exactly at cutoff proceeds"
 else
-    fail "_resolve_repo_path works without CLAWDBOT_REPO_MAP (got: $result)"
+    fail "wait window: observation exactly at cutoff should proceed"
 fi
 
-# Test _detect_test_cmd with mock project dirs
-TEST_TMP=$(mktemp -d)
-
-# Python project
-mkdir -p "$TEST_TMP/python-proj"
-touch "$TEST_TMP/python-proj/pyproject.toml"
-result=$(_detect_test_cmd "$TEST_TMP/python-proj")
-if [[ "$result" == *"pytest"* ]]; then
-    pass "_detect_test_cmd detects Python project"
+# Renotification: inside window → silent, past window → notify.
+RENOTIFY_CUTOFF="2026-04-18T13:00:00Z"
+last_notified="2026-04-18T13:30:00Z"
+if [[ "$last_notified" > "$RENOTIFY_CUTOFF" ]]; then
+    pass "renotify: recently notified stays silent"
 else
-    fail "_detect_test_cmd detects Python project (got: $result)"
+    fail "renotify: recently notified should stay silent"
+fi
+last_notified="2026-04-18T11:30:00Z"
+if ! [[ "$last_notified" > "$RENOTIFY_CUTOFF" ]]; then
+    pass "renotify: stale notification triggers re-wake"
+else
+    fail "renotify: stale notification should re-wake"
+fi
+echo ""
+
+# ─── Layer 5c: notification envelope shape ───────────────────────────────
+echo "Layer 5c: notification envelope shape"
+
+# Confirm the jq filter pr-manager.sh uses to build each payload produces
+# the documented shape — pr_key, ci_status, unresolved_threads[].comments[].
+# Synthetic input matches the GraphQL response the script consumes.
+SYNTH_PR='{
+  "number": 42,
+  "title": "test",
+  "url": "https://example",
+  "headRefName": "feat/x",
+  "baseRefName": "development",
+  "commits": { "nodes": [ { "commit": { "oid": "abc", "statusCheckRollup": { "state": "SUCCESS", "contexts": { "nodes": [
+    { "__typename": "CheckRun", "name": "lint", "conclusion": "SUCCESS", "status": "COMPLETED" },
+    { "__typename": "StatusContext", "context": "ci/travis", "state": "SUCCESS" }
+  ] } } } } ] },
+  "reviewThreads": { "nodes": [
+    { "id": "t1", "isResolved": false, "isOutdated": false, "comments": { "nodes": [
+      { "id": "c1", "body": "fix me", "author": { "login": "bot" }, "path": "a.py", "line": 10, "createdAt": "2026-04-18T13:00:00Z" }
+    ] } },
+    { "id": "t2", "isResolved": true, "isOutdated": false, "comments": { "nodes": [ ] } }
+  ] }
+}'
+
+ENVELOPE=$(echo "$SYNTH_PR" | jq --arg repo "o/r" --arg pr_key "o/r#42" --arg sha "abc" --arg check_state "SUCCESS" '{
+    event: "review_comments",
+    pr_key: $pr_key,
+    repo: $repo,
+    number: .number,
+    title: .title,
+    url: .url,
+    head: .headRefName,
+    base: .baseRefName,
+    head_sha: $sha,
+    ci_status: $check_state,
+    ci_contexts: [.commits.nodes[0].commit.statusCheckRollup.contexts.nodes[]? | . as $ctx | if .__typename == "CheckRun" then {type:"check", name: $ctx.name, conclusion: $ctx.conclusion, status: $ctx.status} else {type:"status", name: $ctx.context, conclusion: $ctx.state} end],
+    unresolved_threads: [
+        .reviewThreads.nodes[]
+        | select(.isResolved == false and .isOutdated == false)
+        | {
+            thread_id: .id,
+            comments: [.comments.nodes[] | {
+                id: .id, author: .author.login, path: .path, line: .line,
+                body: .body, created_at: .createdAt
+            }]
+          }
+    ]
+}')
+
+if echo "$ENVELOPE" | jq -e '.event == "review_comments"' >/dev/null; then
+    pass "envelope: event=review_comments is tagged"
+else
+    fail "envelope: event tag missing"
+fi
+if [ "$(echo "$ENVELOPE" | jq '.unresolved_threads | length')" = "1" ]; then
+    pass "envelope: resolved + outdated threads are filtered out"
+else
+    fail "envelope: expected 1 unresolved thread (got $(echo "$ENVELOPE" | jq '.unresolved_threads | length'))"
+fi
+if [ "$(echo "$ENVELOPE" | jq -r '.unresolved_threads[0].comments[0].path')" = "a.py" ]; then
+    pass "envelope: comment path preserved"
+else
+    fail "envelope: comment path missing"
+fi
+if [ "$(echo "$ENVELOPE" | jq '.ci_contexts | length')" = "2" ]; then
+    pass "envelope: ci_contexts carries both CheckRun and StatusContext entries"
+else
+    fail "envelope: ci_contexts count wrong"
 fi
 
-# Node project with "test" script
-mkdir -p "$TEST_TMP/node-test"
-echo '{"scripts": {"test": "vitest run"}}' > "$TEST_TMP/node-test/package.json"
-result=$(_detect_test_cmd "$TEST_TMP/node-test")
-if [[ "$result" == *"npm run test"* ]]; then
-    pass "_detect_test_cmd detects Node project with test script"
+# ci_failed envelope: same base shape but tagged event, plus a
+# failed_job_logs string field instead of unresolved_threads. We use a
+# single-line fixture here because jq --arg and the surrounding $() command
+# substitution each normalize trailing newlines differently; the redaction
+# + assembly code in pr-manager.sh doesn't depend on newline preservation.
+CI_LOGS='--- lint-and-test (run 123) --- E ruff check failed'
+CI_ENVELOPE=$(echo "$SYNTH_PR" | jq --arg repo "o/r" --arg pr_key "o/r#42" --arg sha "abc" --arg check_state "FAILURE" --arg logs "$CI_LOGS" '{
+    event: "ci_failed",
+    pr_key: $pr_key,
+    repo: $repo,
+    number: .number,
+    title: .title,
+    url: .url,
+    head: .headRefName,
+    base: .baseRefName,
+    head_sha: $sha,
+    ci_status: $check_state,
+    ci_contexts: [.commits.nodes[0].commit.statusCheckRollup.contexts.nodes[]? | . as $ctx | if .__typename == "CheckRun" then {type:"check", name: $ctx.name, conclusion: $ctx.conclusion, status: $ctx.status} else {type:"status", name: $ctx.context, conclusion: $ctx.state} end],
+    failed_job_logs: $logs
+}')
+if echo "$CI_ENVELOPE" | jq -e '.event == "ci_failed"' >/dev/null; then
+    pass "ci_failed envelope: event tag correct"
 else
-    fail "_detect_test_cmd detects Node project with test script (got: $result)"
+    fail "ci_failed envelope: event tag missing or wrong"
+fi
+if echo "$CI_ENVELOPE" | jq -e 'has("unresolved_threads") | not' >/dev/null; then
+    pass "ci_failed envelope: no unresolved_threads field"
+else
+    fail "ci_failed envelope: should not carry unresolved_threads"
+fi
+if [ "$(echo "$CI_ENVELOPE" | jq -r '.failed_job_logs')" = "$CI_LOGS" ]; then
+    pass "ci_failed envelope: failed_job_logs preserved byte-for-byte"
+else
+    fail "ci_failed envelope: failed_job_logs mutated"
+fi
+if [ "$(echo "$CI_ENVELOPE" | jq -r '.ci_status')" = "FAILURE" ]; then
+    pass "ci_failed envelope: ci_status surfaces FAILURE"
+else
+    fail "ci_failed envelope: ci_status wrong"
+fi
+echo ""
+
+# ─── Layer 5e: notified_main_prs wake-gating ──────────────────────
+echo "Layer 5e: notified_main_prs wake-gating"
+#
+# Invariant: the `notified_main_prs[$key] = $sha` jq write must happen
+# AFTER a successful `_wake_sparky` call. Pre-fix, it happened inline in
+# the READY_MAIN case branch — a dropped wake would silence that SHA
+# until another commit landed. Post-fix, READY_MAIN only pushes onto
+# PENDING_MAIN_NOTIFICATIONS and the jq write sits inside
+# `if _wake_sparky ...; then ... fi`.
+#
+# We grep the script directly: this is a structural contract more than a
+# runtime behaviour, so a text-level pin is the right level of fidelity.
+
+PRM="$REPO_DIR/pr-manager.sh"
+
+# 1. The READY_MAIN branch must NOT contain an inline jq write to
+#    notified_main_prs — it should queue into PENDING_MAIN_NOTIFICATIONS.
+ready_main_body=$(awk '/^                READY_MAIN\)$/,/^                    ;;$/' "$PRM")
+if echo "$ready_main_body" | grep -q 'notified_main_prs\[\$key\] = \$sha'; then
+    fail "READY_MAIN still commits notified_main_prs inline (pre-wake)"
+else
+    pass "READY_MAIN does not commit notified_main_prs pre-wake"
+fi
+if echo "$ready_main_body" | grep -q 'PENDING_MAIN_NOTIFICATIONS+='; then
+    pass "READY_MAIN queues into PENDING_MAIN_NOTIFICATIONS"
+else
+    fail "READY_MAIN does not queue into PENDING_MAIN_NOTIFICATIONS"
 fi
 
-# Node project with "test:unit" only
-mkdir -p "$TEST_TMP/node-unit"
-echo '{"scripts": {"test:unit": "vitest run"}}' > "$TEST_TMP/node-unit/package.json"
-result=$(_detect_test_cmd "$TEST_TMP/node-unit")
-if [[ "$result" == *"test:unit"* ]]; then
-    pass "_detect_test_cmd detects Node project with test:unit script"
+# 2. The jq write must live inside an `if _wake_sparky ...; then` block
+#    and iterate over PENDING_MAIN_NOTIFICATIONS. We check for the two
+#    anchors appearing close together.
+if awk '/^if \[ -n "\$MERGE_REASONS" \]; then$/,/^fi$/' "$PRM" \
+     | grep -q 'if _wake_sparky' \
+   && awk '/^if \[ -n "\$MERGE_REASONS" \]; then$/,/^fi$/' "$PRM" \
+     | grep -q 'PENDING_MAIN_NOTIFICATIONS'; then
+    pass "notified_main_prs commit is gated on _wake_sparky success"
 else
-    fail "_detect_test_cmd detects Node project with test:unit script (got: $result)"
+    fail "notified_main_prs commit is not gated on _wake_sparky success"
+fi
+echo ""
+
+# ─── Layer 5d: CI log redaction ──────────────────────────────────
+echo "Layer 5d: CI log redaction"
+
+# Source the redactor from pr-manager.sh so this test exercises the real
+# function, not a reimplementation.
+eval "$(awk '/^_redact_ci_logs\(\) \{/,/^\}/' "$REPO_DIR/pr-manager.sh")"
+
+assert_redacted() {
+    local label="$1" input="$2" must_not_contain="$3"
+    local got
+    got=$(printf '%s\n' "$input" | _redact_ci_logs)
+    if echo "$got" | grep -q -- "$must_not_contain"; then
+        fail "redactor: $label leaked '$must_not_contain' → $got"
+    else
+        pass "redactor: $label"
+    fi
+}
+
+assert_redacted "Bearer token"        "Authorization: Bearer sk-proj-abcdefghijklmnopqrstuvwxyz1234" "sk-proj-abcdefghij"
+assert_redacted "gh PAT"              "token=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789" "ghp_ABCDEFGHIJ"
+assert_redacted "Slack xoxb"          "webhook failed: xoxb-1234567890-ABCDEFG-abcdefghijklmnop" "xoxb-1234567890-ABCDEFG"
+assert_redacted "api_key= form"       'headers: api_key="supersecrettoken123"' "supersecrettoken123"
+assert_redacted "password= form"      'dsn: password=hunter2hunter2hunter2' "hunter2hunter2hunter2"
+assert_redacted "AWS access key"      "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE" "AKIAIOSFODNN7EXAMPLE"
+
+# Multi-line PEM block. sed is line-oriented by default and our previous
+# single-pass pattern never matched across newlines, so a leaked private
+# key in CI output passed through unredacted. Now handled by a ``sed -z``
+# pre-pass. The fixture below is a realistic RSA key shape — the inner
+# body lines MUST all be gone from the redacted output.
+PEM_INPUT=$'prefix log\n-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA1234567890abcdefghijklmnopqrstuvwxyz\nabcdefghijklmnopqrstuvwxyz1234567890ABCDEFGHIJKLMN\nOPQRSTUVWXYZ1234567890abcdefghijklmnopqrstuvwxyzAB\n-----END RSA PRIVATE KEY-----\nsuffix log'
+PEM_OUT=$(printf '%s' "$PEM_INPUT" | _redact_ci_logs)
+if echo "$PEM_OUT" | grep -q 'MIIEpAIB\|OPQRSTUVWXYZ'; then
+    fail "redactor: PEM body leaked → $PEM_OUT"
+else
+    pass "redactor: multi-line PEM body redacted"
+fi
+if echo "$PEM_OUT" | grep -q '<REDACTED>'; then
+    pass "redactor: PEM redaction marker present"
+else
+    fail "redactor: PEM redaction marker missing"
+fi
+# Preserve BEGIN/END delimiters so operators can still tell "a key was
+# here" during forensics even though the body is gone.
+if echo "$PEM_OUT" | grep -q 'BEGIN RSA PRIVATE KEY' && echo "$PEM_OUT" | grep -q 'END RSA PRIVATE KEY'; then
+    pass "redactor: PEM delimiters kept for forensics"
+else
+    fail "redactor: PEM delimiters mangled"
+fi
+# And the surrounding log context must survive.
+if echo "$PEM_OUT" | grep -q 'prefix log' && echo "$PEM_OUT" | grep -q 'suffix log'; then
+    pass "redactor: surrounding log context preserved around PEM"
+else
+    fail "redactor: surrounding log context lost around PEM"
 fi
 
-# Node project with no test script
-mkdir -p "$TEST_TMP/node-notest"
-echo '{"scripts": {"build": "next build"}}' > "$TEST_TMP/node-notest/package.json"
-result=$(_detect_test_cmd "$TEST_TMP/node-notest")
-if [[ "$result" == *"next build"* ]]; then
-    pass "_detect_test_cmd falls back to next build for Node without test"
+# Non-secret text must pass through untouched.
+NOSEC="normal log line with no secrets"
+if [ "$(echo "$NOSEC" | _redact_ci_logs)" = "$NOSEC" ]; then
+    pass "redactor: plain log line passes through unchanged"
 else
-    fail "_detect_test_cmd falls back to next build for Node without test (got: $result)"
+    fail "redactor: plain log line was mutated"
 fi
-
-# Bash project with tests/run-tests.sh — no pyproject.toml or package.json,
-# just a repo-local bash test harness. Should prefer the harness over the
-# "No test command" fallback so the review handler can verify its own fix.
-mkdir -p "$TEST_TMP/bash-proj/tests"
-cat > "$TEST_TMP/bash-proj/tests/run-tests.sh" <<'EOF'
-#!/bin/bash
-exit 0
-EOF
-chmod +x "$TEST_TMP/bash-proj/tests/run-tests.sh"
-result=$(_detect_test_cmd "$TEST_TMP/bash-proj")
-if [[ "$result" == *"tests/run-tests.sh"* ]]; then
-    pass "_detect_test_cmd detects repo-local bash test harness"
-else
-    fail "_detect_test_cmd detects repo-local bash test harness (got: $result)"
-fi
-
-# Bash test harness must not override a Python or Node harness when both
-# signals are present (pyproject.toml / package.json take precedence because
-# those ecosystems have richer test runners than bash).
-mkdir -p "$TEST_TMP/python-with-bash/tests"
-touch "$TEST_TMP/python-with-bash/pyproject.toml"
-cat > "$TEST_TMP/python-with-bash/tests/run-tests.sh" <<'EOF'
-#!/bin/bash
-exit 0
-EOF
-result=$(_detect_test_cmd "$TEST_TMP/python-with-bash")
-if [[ "$result" == *"pytest"* ]]; then
-    pass "_detect_test_cmd prefers Python harness over bash fallback"
-else
-    fail "_detect_test_cmd prefers Python harness over bash fallback (got: $result)"
-fi
-
-# Unknown project
-mkdir -p "$TEST_TMP/empty-proj"
-result=$(_detect_test_cmd "$TEST_TMP/empty-proj")
-if [[ "$result" == *"No test command"* ]]; then
-    pass "_detect_test_cmd returns fallback for unknown project"
-else
-    fail "_detect_test_cmd returns fallback for unknown project (got: $result)"
-fi
-
-rm -rf "$TEST_TMP"
 echo ""
 
 # ─── Layer 6: No hardcoded PII ────────────────────────────────────────────

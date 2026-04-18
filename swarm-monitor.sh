@@ -79,7 +79,7 @@ done
 if [ ${#WAKE_MESSAGES[@]} -gt 0 ]; then
   COMBINED=$(printf '%s\n' "${WAKE_MESSAGES[@]}")
   log "Waking Spark with ${#WAKE_MESSAGES[@]} items"
-  openclaw cron wake --text "SWARM ALERT:\n${COMBINED}\n\nIf any PR has ci=fail, auto-fix it: pull failed CI logs, diagnose, fix if <20 lines, commit and push. If complex, message Dmitri. Announce results via message tool." --mode now 2>/dev/null || log "Wake failed"
+  openclaw cron wake --text "SWARM ALERT:\n${COMBINED}\n\nIf any PR has ci=fail, auto-fix it: pull failed CI logs, diagnose, fix if <20 lines, commit and push. If complex, message the maintainer. Announce results via message tool." --mode now 2>/dev/null || log "Wake failed"
 else
   log "Nothing new"
 fi
