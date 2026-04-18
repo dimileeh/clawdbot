@@ -139,8 +139,13 @@ while : ; do
       }' \
     -f owner="$OWNER" -f repo="$REPO" -F number="$PR" \
     $( [ "$cursor" = "null" ] || echo -f cursor="$cursor" ))
-  threads=$(jq -n --argjson acc "$threads" --argjson page "$page" \
-    '$acc + $page.data.repository.pullRequest.reviewThreads.nodes')
+  # Accumulate via stdin instead of ``--argjson``: on very large PRs
+  # (hundreds of threads, especially with chatty bots) the accumulated
+  # JSON can cross the OS ``argv`` size limit (``E2BIG``) and the
+  # command silently truncates or fails. Piping through stdin keeps
+  # payload size unbounded.
+  threads=$(printf '%s\n%s' "$threads" "$page" | jq -cs \
+    '.[0] + .[1].data.repository.pullRequest.reviewThreads.nodes')
   has_next=$(echo "$page" | jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.hasNextPage')
   [ "$has_next" = "true" ] || break
   cursor=$(echo "$page" | jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.endCursor')
@@ -196,31 +201,59 @@ gh api graphql -f query='
 **Option B: REST reply + GraphQL resolve.** Same effect; the REST path needs the numeric comment id rather than the thread node id.
 
 **Never guess the parent comment id.** The reply REST endpoint
-(`POST /repos/OWNER/REPO/pulls/NUM/comments/COMMENT_ID/replies`)
+(`POST /repos/OWNER/REPO/pulls/<PR_NUMBER>/comments/<COMMENT_ID>/replies`)
 needs the *first* comment's numeric `databaseId` on the thread, not
-the thread's node id and not the id of a later reply. Always
-re-fetch it from the same GraphQL query that gave you the unresolved
-list in Step 4:
+the thread's node id and not the id of a later reply. Two ways to
+fetch it, pick whichever fits your surrounding code.
+
+**GraphQL — targeted, no pagination.** Use `node(id: ...)` to fetch
+the thread directly instead of listing all threads and filtering.
+This also works on PRs with >100 threads without any pagination
+concerns:
 
 ```bash
-gh api graphql -f query='
-  query($owner: String!, $repo: String!, $number: Int!) {
-    repository(owner: $owner, name: $repo) {
-      pullRequest(number: $number) {
-        reviewThreads(first:100) {
-          nodes { id comments(first:1) { nodes { databaseId } } }
+gh api graphql \
+  -f query='
+    query($threadId: ID!) {
+      node(id: $threadId) {
+        ... on PullRequestReviewThread {
+          comments(first: 1) { nodes { databaseId } }
         }
       }
-    }
-  }' -f owner="OWNER" -f repo="REPO" -F number=<N> \
-  --jq '.data.repository.pullRequest.reviewThreads.nodes[] | select(.id == "<THREAD_ID>") | .comments.nodes[0].databaseId'
+    }' \
+  -f threadId="<THREAD_ID>" \
+  --jq '.data.node.comments.nodes[0].databaseId'
 ```
 
-Then:
+**REST alternative — when you already have the numeric comment id.**
+
+The REST API can *read* a review comment by its numeric id, but it
+can't map from a thread node id to the first comment's numeric id
+— only GraphQL does that. If you have a comment id from elsewhere
+(a pr-manager wake envelope, a webhook payload, a prior
+`gh api /repos/OWNER/REPO/pulls/<PR_NUMBER>/comments` listing), you
+can inspect it via REST instead of GraphQL:
 
 ```bash
-# Reply via REST (needs the numeric comment id from the query above).
-gh api "repos/OWNER/REPO/pulls/NUM/comments/<COMMENT_ID>/replies" \
+# Inspect a single comment by its numeric id.
+gh api "repos/OWNER/REPO/pulls/comments/<COMMENT_ID>" \
+  --jq '{id, path, line, body}'
+
+# Or list every review comment on the PR (paginated automatically
+# by gh when --paginate is set) and filter in jq.
+gh api --paginate "repos/OWNER/REPO/pulls/<PR_NUMBER>/comments" \
+  --jq '.[] | {id, path, line, body, in_reply_to_id}'
+```
+
+For mapping a specific thread node id → first comment's numeric id,
+the GraphQL `node(id: ...)` query above is the right tool. REST has
+no equivalent.
+
+Once you have the parent comment id, post the reply + resolve:
+
+```bash
+# Reply via REST (needs the numeric comment id from above).
+gh api "repos/OWNER/REPO/pulls/<PR_NUMBER>/comments/<COMMENT_ID>/replies" \
   -X POST -f body="<REPLY_TEXT>"
 
 # Resolve via GraphQL (needs the thread node id).
