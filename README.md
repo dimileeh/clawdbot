@@ -161,16 +161,22 @@ Add this to your workspace `AGENTS.md` (or `HEARTBEAT.md`):
 - PR status: watch `~/.clawdbot/logs/pr-manager.log` (emitted every 5 minutes by `pr-manager.sh`).
 ```
 
-### 2. Install the swarm skill (recommended)
+### 2. Install the skills (recommended)
 
-The swarm skill (`SKILL.md` in this repo) gives your agent structured knowledge of the full spawn → monitor → review → merge lifecycle. Copy it into your OpenClaw skills directory:
+clawdbot ships two skills that give your OpenClaw agent structured knowledge of the full lifecycle:
+
+- **`SKILL.md`** at the repo root — the **swarm** skill: spawning coding agents, choosing the right model, monitoring tmux sessions, delegating work.
+- **`skills/pr-review-hygiene/SKILL.md`** — the **pr-review-hygiene** skill: how the orchestrator should consume `pr-manager.sh`'s wake events, the triage → fix → push → verify → reply → resolve loop, and the rules for when NOT to resolve a thread.
+
+Install both:
 
 ```bash
-mkdir -p ~/.openclaw/skills/swarm
+mkdir -p ~/.openclaw/skills/swarm ~/.openclaw/skills/pr-review-hygiene
 cp ~/.clawdbot/SKILL.md ~/.openclaw/skills/swarm/SKILL.md
+cp ~/.clawdbot/skills/pr-review-hygiene/SKILL.md ~/.openclaw/skills/pr-review-hygiene/SKILL.md
 ```
 
-With the skill installed, you can just say *"spawn a Codex agent to fix the auth bug in my-backend"* and your agent handles the rest — worktree creation, prompt injection, tmux session, and monitoring.
+With the skills installed, you can just say *"spawn a Codex agent to fix the auth bug in my-backend"* (swarm) or let `pr-manager.sh` wake your agent with a structured review envelope (pr-review-hygiene). The agent loads the relevant skill and handles the full loop — worktree creation, prompt injection, thread replies + resolves, and reporting back.
 
 ### 3. How the pieces connect
 
