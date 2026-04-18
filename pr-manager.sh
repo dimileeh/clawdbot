@@ -292,8 +292,15 @@ for REPO in $REPOS; do
                 READY_DEV)
                     HAS_OPEN_DEV_MAIN=$(echo "$PR_DATA" | jq --arg integration "$INTEGRATION_BRANCH" --arg main "$MAIN_BRANCH" '[.data.repository.pullRequests.nodes[] | select(.baseRefName == $main and .headRefName == $integration)] | length')
                     if [ "$HAS_OPEN_DEV_MAIN" -gt 0 ]; then
-                        echo "$LOG_PREFIX     ⏸️ Holding — open development→main PR exists"
-                        MERGE_REASONS="${MERGE_REASONS}⏸️ Holding $PR_KEY (ready to merge to development) — open dev→main PR exists\n"
+                        # Log-only: do NOT add to MERGE_REASONS. Otherwise
+                        # every tick (every 5 minutes) re-wakes the
+                        # orchestrator with the same "still holding"
+                        # message until the blocker PR closes, which is
+                        # noise for a known, expected interlock. The
+                        # operator can grep the log file if they want a
+                        # history; the state is also visible in GitHub
+                        # (the feature PR is simply still open).
+                        echo "$LOG_PREFIX     ⏸️ Holding $PR_KEY — open $INTEGRATION_BRANCH→$MAIN_BRANCH PR exists"
                         continue
                     fi
                     ALREADY_MERGED=$(jq -r ".merged_prs[\"$PR_KEY\"] // \"\"" "$STATE_FILE")
