@@ -121,6 +121,25 @@ Every resolved thread must have a reply from you first. The reply should include
 - What tests now pin it (if any were added)
 - Test status (e.g., "189/189 Slack tests passing, ruff + mypy clean")
 
+**Never guess the parent comment id.** The reply REST endpoint
+(`POST /repos/OWNER/REPO/pulls/NUM/comments/COMMENT_ID/replies`)
+needs the *first* comment's numeric `databaseId` on the thread, not
+the thread's node id and not the id of a later reply. Always
+re-fetch it from the same GraphQL query that gave you the unresolved
+list in Step 4:
+
+```bash
+gh api graphql -f query='{ repository(owner:"OWNER", name:"REPO") { pullRequest(number:NUM) { reviewThreads(first:100) { nodes { id comments(first:1) { nodes { databaseId } } } } } } }' \
+  --jq '.data.repository.pullRequest.reviewThreads.nodes[] | select(.id == "<THREAD_ID>") | .comments.nodes[0].databaseId'
+```
+
+Then:
+
+```bash
+gh api "repos/OWNER/REPO/pulls/NUM/comments/<COMMENT_ID>/replies" \
+  -X POST -f body="...your reply..."
+```
+
 Review-bot threads get resolved via GraphQL:
 
 ```bash
