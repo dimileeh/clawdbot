@@ -425,7 +425,7 @@ else
         | map(select(.value <= $cutoff))
         | map("\(.key)@\(.value)")
         | join(",")
-    ' "$REVIEW_STATE_FILE" 2>/dev/null || true)
+    ' "$REVIEW_STATE_FILE" || true)
 
     if [ -n "$STALE_EVICTED" ] && [ "$STALE_EVICTED" != "null" ]; then
         echo "$LOG_PREFIX 🧹 Evicting stale in_progress marker(s) older than ${STALE_IN_PROGRESS_MINUTES}m: $STALE_EVICTED"
