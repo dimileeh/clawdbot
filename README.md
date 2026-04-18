@@ -161,16 +161,32 @@ Add this to your workspace `AGENTS.md` (or `HEARTBEAT.md`):
 - PR status: watch `~/.clawdbot/logs/pr-manager.log` (emitted every 5 minutes by `pr-manager.sh`).
 ```
 
-### 2. Install the swarm skill (recommended)
+### 2. Install the skills (recommended)
 
-The swarm skill (`SKILL.md` in this repo) gives your agent structured knowledge of the full spawn → monitor → review → merge lifecycle. Copy it into your OpenClaw skills directory:
+clawdbot ships two skills under `skills/` that give your OpenClaw agent structured knowledge of the full lifecycle:
+
+- **`skills/swarm/SKILL.md`** — the **swarm** skill: spawning coding agents, choosing the right model, monitoring tmux sessions, delegating work.
+- **`skills/pr-review-hygiene/SKILL.md`** — the **pr-review-hygiene** skill: how the orchestrator should consume `pr-manager.sh`'s wake events, the triage → fix → push → verify → reply → resolve loop, and the rules for when NOT to resolve a thread.
+
+Install both with a single loop that preserves each skill's directory name:
 
 ```bash
-mkdir -p ~/.openclaw/skills/swarm
-cp ~/.clawdbot/SKILL.md ~/.openclaw/skills/swarm/SKILL.md
+for skill in ~/.clawdbot/skills/*/; do
+  name=$(basename "$skill")
+  mkdir -p "$HOME/.openclaw/skills/$name"
+  cp "$skill/SKILL.md" "$HOME/.openclaw/skills/$name/SKILL.md"
+done
 ```
 
-With the skill installed, you can just say *"spawn a Codex agent to fix the auth bug in my-backend"* and your agent handles the rest — worktree creation, prompt injection, tmux session, and monitoring.
+Or install individually:
+
+```bash
+mkdir -p ~/.openclaw/skills/swarm ~/.openclaw/skills/pr-review-hygiene
+cp ~/.clawdbot/skills/swarm/SKILL.md ~/.openclaw/skills/swarm/SKILL.md
+cp ~/.clawdbot/skills/pr-review-hygiene/SKILL.md ~/.openclaw/skills/pr-review-hygiene/SKILL.md
+```
+
+With the skills installed, you can just say *"spawn a Codex agent to fix the auth bug in my-backend"* (swarm) or let `pr-manager.sh` wake your agent with a structured review envelope (pr-review-hygiene). The agent loads the relevant skill and handles the full loop — worktree creation, prompt injection, thread replies + resolves, and reporting back.
 
 ### 3. How the pieces connect
 
@@ -246,26 +262,30 @@ Every script sources `.env` on startup with safe fallbacks, so existing env vars
 
 ```
 ~/.clawdbot/
-├── .env                  # Local config (gitignored)
-├── .env.example          # Template for .env
-├── AGENTS.md             # Instructions injected into every agent
+├── .env                        # Local config (gitignored)
+├── .env.example               # Template for .env
+├── AGENTS.md                  # Instructions injected into every agent
 ├── README.md
 ├── LICENSE
-├── spawn-agent.sh         # Spawn a coding agent in a worktree
-├── check-agents.sh        # Check status of all tracked tasks (swarm)
-├── cleanup-task.sh        # Clean up finished task worktree
-├── finalize-task.sh       # Auto-called on agent exit
-├── agent-precheck.sh      # Validate GitHub API + repo access (swarm)
+├── spawn-agent.sh             # Spawn a coding agent in a worktree
+├── check-agents.sh            # Check status of all tracked tasks (swarm)
+├── cleanup-task.sh            # Clean up finished task worktree
+├── finalize-task.sh           # Auto-called on agent exit
+├── agent-precheck.sh          # Validate GitHub API + repo access (swarm)
 │
-├── pr-manager.sh          # GitHub PR watchdog — merges, notifies Sparky
-├── pr-review-collector.sh # Emit unresolved review threads as JSON
-├── swarm-monitor.sh       # Zero-LLM swarm monitor (cron, 3 min)
+├── pr-manager.sh              # GitHub PR watchdog — merges, notifies Sparky
+├── pr-review-collector.sh     # Emit unresolved review threads as JSON
+├── swarm-monitor.sh           # Zero-LLM swarm monitor (cron, 3 min)
 │
-├── logs/                 # Cron output (gitignored)
-├── prompts/              # Agent prompt files (gitignored)
-├── runners/              # tmux session metadata (gitignored)
-├── memory/               # Agent memory files (gitignored)
-└── *.json                # State files (gitignored)
+├── skills/                    # Orchestrator skills (copy into ~/.openclaw/skills/)
+│   ├── swarm/SKILL.md             # Spawning and orchestrating coding agents
+│   └── pr-review-hygiene/SKILL.md # Consuming pr-manager wakes: triage, fix, reply, resolve
+│
+├── logs/                      # Cron output (gitignored)
+├── prompts/                   # Agent prompt files (gitignored)
+├── runners/                   # tmux session metadata (gitignored)
+├── memory/                    # Agent memory files (gitignored)
+└── *.json                     # State files (gitignored)
 ```
 
 ## Usage
