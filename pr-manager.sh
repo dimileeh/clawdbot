@@ -126,8 +126,19 @@ _wake_sparky() {
 # widens the blast radius of a single bad log line. Matches are conservative
 # (false positives are fine; we'd rather redact a harmless string than leak
 # a live token).
+#
+# Two-pass pipeline:
+#   1. ``sed -z`` processes the whole input as a single NUL-delimited
+#      record so multi-line PEM blocks match as a unit. We match the full
+#      BEGIN...END envelope (greedy within the non-``-`` body is safe
+#      because ``-`` only appears in the delimiter lines themselves).
+#      If a PEM block is truncated (no END yet) the single-line pass in
+#      step 2 still scrubs the BEGIN header.
+#   2. Per-line pass for all single-line token patterns (Bearer, api_key,
+#      gh/slack/openai/aws) which don't span newlines.
 _redact_ci_logs() {
-    sed -E \
+    sed -zE 's#(-----BEGIN[[:space:]]+[A-Z ][A-Z ]*PRIVATE[[:space:]]+KEY-----)[^-]*(-----END[[:space:]]+[A-Z ][A-Z ]*PRIVATE[[:space:]]+KEY-----)#\1<REDACTED>\2#g' \
+    | sed -E \
         -e 's#(Authorization:[[:space:]]*Bearer[[:space:]]+)[A-Za-z0-9._/+=-]+#\1<REDACTED>#gi' \
         -e 's#(Authorization:[[:space:]]*Basic[[:space:]]+)[A-Za-z0-9+/=]+#\1<REDACTED>#gi' \
         -e 's#(Bearer[[:space:]]+)[A-Za-z0-9._/+=-]{20,}#\1<REDACTED>#gi' \
@@ -135,14 +146,17 @@ _redact_ci_logs() {
         -e 's#(gh[oprsu]_)[A-Za-z0-9]{30,}#\1<REDACTED>#g' \
         -e 's#(xox[abprs]-)[A-Za-z0-9-]{10,}#\1<REDACTED>#g' \
         -e 's#(sk-(proj-)?)[A-Za-z0-9_-]{20,}#\1<REDACTED>#g' \
-        -e 's#(AKIA)[0-9A-Z]{16}#\1<REDACTED>#g' \
-        -e 's#(-----BEGIN[[:space:]]+[A-Z ]+[[:space:]]+PRIVATE[[:space:]]+KEY-----).*(-----END[[:space:]]+[A-Z ]+[[:space:]]+PRIVATE[[:space:]]+KEY-----)#\1<REDACTED>\2#g'
+        -e 's#(AKIA)[0-9A-Z]{16}#\1<REDACTED>#g'
 }
 
 # ─── Per-repo PR scan ────────────────────────────────────────────────────
 
 MERGE_REASONS=""
 NOTIFY_BLOBS=()
+# READY_MAIN entries ("$PR_KEY|$COMMIT_SHA") queued during classification and
+# committed to notified_main_prs only after the wake that announces them
+# actually succeeds. See the MERGE_REASONS delivery block below.
+PENDING_MAIN_NOTIFICATIONS=()
 
 for REPO in $REPOS; do
     echo "$LOG_PREFIX Checking $REPO..."
@@ -305,8 +319,12 @@ for REPO in $REPOS; do
                         continue
                     fi
                     MERGE_REASONS="${MERGE_REASONS}🟢 $PR_KEY ready to merge to main: $PR_TITLE\n   All comments resolved, checks green, mergeable.\n   $PR_URL\n"
-                    jq --arg key "$PR_KEY" --arg sha "$COMMIT_SHA" \
-                        '.notified_main_prs[$key] = $sha' "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+                    # Defer the notified_main_prs write until after the
+                    # MERGE_REASONS wake succeeds (see the delivery block
+                    # further down). Marking a PR as notified before the
+                    # wake silences that SHA on a dropped delivery and
+                    # suppresses retries until another commit lands.
+                    PENDING_MAIN_NOTIFICATIONS+=("$PR_KEY|$COMMIT_SHA")
                     ;;
 
                 HAS_COMMENTS)
@@ -530,7 +548,18 @@ done
 # ─── Merge/notification events (PR-lifecycle bookkeeping, not reviews) ────
 if [ -n "$MERGE_REASONS" ]; then
     WAKE_TEXT=$(printf '🔧 PR Manager report:\n\n%b' "$MERGE_REASONS")
-    _wake_sparky "$WAKE_TEXT"
+    # Commit the notified_main_prs entries only AFTER a successful wake.
+    # A dropped delivery leaves the SHA "not notified" so the next tick
+    # retries, matching the review/CI notification contract above.
+    if _wake_sparky "$WAKE_TEXT"; then
+        for pending in "${PENDING_MAIN_NOTIFICATIONS[@]:-}"; do
+            [ -z "$pending" ] && continue
+            pending_key="${pending%%|*}"
+            pending_sha="${pending##*|}"
+            jq --arg key "$pending_key" --arg sha "$pending_sha" \
+                '.notified_main_prs[$key] = $sha' "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+        done
+    fi
 fi
 
 # ─── State hygiene ───────────────────────────────────────────────────────

@@ -342,6 +342,48 @@ else
 fi
 echo ""
 
+# ─── Layer 5e: notified_main_prs wake-gating ──────────────────────
+echo "Layer 5e: notified_main_prs wake-gating"
+#
+# Invariant: the `notified_main_prs[$key] = $sha` jq write must happen
+# AFTER a successful `_wake_sparky` call. Pre-fix, it happened inline in
+# the READY_MAIN case branch — a dropped wake would silence that SHA
+# until another commit landed. Post-fix, READY_MAIN only pushes onto
+# PENDING_MAIN_NOTIFICATIONS and the jq write sits inside
+# `if _wake_sparky ...; then ... fi`.
+#
+# We grep the script directly: this is a structural contract more than a
+# runtime behaviour, so a text-level pin is the right level of fidelity.
+
+PRM="$REPO_DIR/pr-manager.sh"
+
+# 1. The READY_MAIN branch must NOT contain an inline jq write to
+#    notified_main_prs — it should queue into PENDING_MAIN_NOTIFICATIONS.
+ready_main_body=$(awk '/^                READY_MAIN\)$/,/^                    ;;$/' "$PRM")
+if echo "$ready_main_body" | grep -q 'notified_main_prs\[\$key\] = \$sha'; then
+    fail "READY_MAIN still commits notified_main_prs inline (pre-wake)"
+else
+    pass "READY_MAIN does not commit notified_main_prs pre-wake"
+fi
+if echo "$ready_main_body" | grep -q 'PENDING_MAIN_NOTIFICATIONS+='; then
+    pass "READY_MAIN queues into PENDING_MAIN_NOTIFICATIONS"
+else
+    fail "READY_MAIN does not queue into PENDING_MAIN_NOTIFICATIONS"
+fi
+
+# 2. The jq write must live inside an `if _wake_sparky ...; then` block
+#    and iterate over PENDING_MAIN_NOTIFICATIONS. We check for the two
+#    anchors appearing close together.
+if awk '/^if \[ -n "\$MERGE_REASONS" \]; then$/,/^fi$/' "$PRM" \
+     | grep -q 'if _wake_sparky' \
+   && awk '/^if \[ -n "\$MERGE_REASONS" \]; then$/,/^fi$/' "$PRM" \
+     | grep -q 'PENDING_MAIN_NOTIFICATIONS'; then
+    pass "notified_main_prs commit is gated on _wake_sparky success"
+else
+    fail "notified_main_prs commit is not gated on _wake_sparky success"
+fi
+echo ""
+
 # ─── Layer 5d: CI log redaction ──────────────────────────────────
 echo "Layer 5d: CI log redaction"
 
@@ -366,6 +408,37 @@ assert_redacted "Slack xoxb"          "webhook failed: xoxb-1234567890-ABCDEFG-a
 assert_redacted "api_key= form"       'headers: api_key="supersecrettoken123"' "supersecrettoken123"
 assert_redacted "password= form"      'dsn: password=hunter2hunter2hunter2' "hunter2hunter2hunter2"
 assert_redacted "AWS access key"      "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE" "AKIAIOSFODNN7EXAMPLE"
+
+# Multi-line PEM block. sed is line-oriented by default and our previous
+# single-pass pattern never matched across newlines, so a leaked private
+# key in CI output passed through unredacted. Now handled by a ``sed -z``
+# pre-pass. The fixture below is a realistic RSA key shape — the inner
+# body lines MUST all be gone from the redacted output.
+PEM_INPUT=$'prefix log\n-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA1234567890abcdefghijklmnopqrstuvwxyz\nabcdefghijklmnopqrstuvwxyz1234567890ABCDEFGHIJKLMN\nOPQRSTUVWXYZ1234567890abcdefghijklmnopqrstuvwxyzAB\n-----END RSA PRIVATE KEY-----\nsuffix log'
+PEM_OUT=$(printf '%s' "$PEM_INPUT" | _redact_ci_logs)
+if echo "$PEM_OUT" | grep -q 'MIIEpAIB\|OPQRSTUVWXYZ'; then
+    fail "redactor: PEM body leaked → $PEM_OUT"
+else
+    pass "redactor: multi-line PEM body redacted"
+fi
+if echo "$PEM_OUT" | grep -q '<REDACTED>'; then
+    pass "redactor: PEM redaction marker present"
+else
+    fail "redactor: PEM redaction marker missing"
+fi
+# Preserve BEGIN/END delimiters so operators can still tell "a key was
+# here" during forensics even though the body is gone.
+if echo "$PEM_OUT" | grep -q 'BEGIN RSA PRIVATE KEY' && echo "$PEM_OUT" | grep -q 'END RSA PRIVATE KEY'; then
+    pass "redactor: PEM delimiters kept for forensics"
+else
+    fail "redactor: PEM delimiters mangled"
+fi
+# And the surrounding log context must survive.
+if echo "$PEM_OUT" | grep -q 'prefix log' && echo "$PEM_OUT" | grep -q 'suffix log'; then
+    pass "redactor: surrounding log context preserved around PEM"
+else
+    fail "redactor: surrounding log context lost around PEM"
+fi
 
 # Non-secret text must pass through untouched.
 NOSEC="normal log line with no secrets"
