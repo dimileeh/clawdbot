@@ -42,16 +42,34 @@ REPOS="${CLAWDBOT_REPOS:?Set CLAWDBOT_REPOS in .env}"
 STATE_FILE="$HOME/.clawdbot/pr-manager-state.json"
 LOG_PREFIX="[pr-manager $(date -u +%H:%M:%S)]"
 
+# Branch names are configurable so teams using different conventions (e.g.
+# trunk-based with a single main branch, or staging/prod instead of
+# development/main) are not forced into our defaults.
+INTEGRATION_BRANCH="${CLAWDBOT_INTEGRATION_BRANCH:-development}"
+MAIN_BRANCH="${CLAWDBOT_MAIN_BRANCH:-main}"
+
 # ─── Tunables ─────────────────────────────────────────────────────────────
 #
 # REVIEW_WAIT_MINUTES: how long to wait after first observing unresolved
 # threads on a given PR+SHA before notifying the orchestrator. Gives review
 # bots (coderabbit / cursor / greptile / gemini / codex) time to converge so
 # Sparky sees the full set at once instead of one thread at a time.
+# Setting this to 0 disables the wait window — each tick can notify as soon
+# as unresolved threads are observed.
 #
 # RENOTIFY_MINUTES: if Sparky was notified and the PR head SHA hasn't
 # advanced and threads are still unresolved after this window, re-notify.
-# Prevents a dropped notification from silently rotting a PR.
+# Prevents a dropped notification from silently rotting a PR. Must be >= 1
+# because a zero-minute renotification window would just spam on every tick.
+_parse_nonneg_int() {
+    local raw="$1" default="$2" name="$3"
+    if [[ "$raw" =~ ^[0-9]+$ ]] && [ "$raw" -ge 0 ]; then
+        echo "$raw"
+    else
+        [ -n "$raw" ] && echo "[pr-manager] ⚠️ Invalid $name='$raw' (must be non-negative integer); using default $default" >&2
+        echo "$default"
+    fi
+}
 _parse_positive_int() {
     local raw="$1" default="$2" name="$3"
     if [[ "$raw" =~ ^[0-9]+$ ]] && [ "$raw" -ge 1 ]; then
@@ -61,8 +79,17 @@ _parse_positive_int() {
         echo "$default"
     fi
 }
-REVIEW_WAIT_MINUTES=$(_parse_positive_int "${CLAWDBOT_REVIEW_WAIT_MINUTES:-15}" 15 CLAWDBOT_REVIEW_WAIT_MINUTES)
+REVIEW_WAIT_MINUTES=$(_parse_nonneg_int "${CLAWDBOT_REVIEW_WAIT_MINUTES:-15}" 15 CLAWDBOT_REVIEW_WAIT_MINUTES)
 RENOTIFY_MINUTES=$(_parse_positive_int "${CLAWDBOT_RENOTIFY_MINUTES:-60}" 60 CLAWDBOT_RENOTIFY_MINUTES)
+
+# Portable ISO-8601 UTC timestamp N minutes in the past. We delegate date
+# arithmetic to jq (which ships with the rest of the pipeline) instead of
+# `date -u -d`, which is GNU-only and silently fails on macOS / BSD. Returns
+# empty string on error so callers can fail-closed.
+_iso_minutes_ago() {
+    local minutes="$1"
+    jq -rn --argjson m "$minutes" 'now - ($m * 60) | strftime("%Y-%m-%dT%H:%M:%SZ")' 2>/dev/null || true
+}
 
 # ─── State File ───────────────────────────────────────────────────────────
 [ -f "$STATE_FILE" ] || echo '{}' > "$STATE_FILE"
@@ -78,16 +105,38 @@ done
 
 # Send a structured-event message to the orchestrator (the "main" OpenClaw
 # session). Uses `openclaw system event` which is the documented wake API
-# for foreground delivery. On failure, logs but does not abort — the next
-# tick will retry based on RENOTIFY_MINUTES.
+# for foreground delivery. Returns the underlying exit code so callers can
+# gate state writes on successful delivery — otherwise a dropped wake would
+# look "notified" in state and suppress retries until RENOTIFY_MINUTES.
 _wake_sparky() {
     local text="$1"
-    if ! openclaw system event \
+    if openclaw system event \
         --mode now \
         --text "$text" \
-        --timeout 5000 2>&1 | tail -2; then
-        echo "$LOG_PREFIX ⚠️ Failed to wake orchestrator; will retry on next renotification window" >&2
+        --timeout 5000 >/dev/null 2>&1; then
+        return 0
     fi
+    echo "$LOG_PREFIX ⚠️ Failed to wake orchestrator; state not marked notified, will retry next tick" >&2
+    return 1
+}
+
+# Redact common secret-ish patterns from CI log tails before shipping them
+# to the orchestrator via `failed_job_logs`. CI runners routinely print raw
+# request bodies, env dumps, and bearer tokens; forwarding those verbatim
+# widens the blast radius of a single bad log line. Matches are conservative
+# (false positives are fine; we'd rather redact a harmless string than leak
+# a live token).
+_redact_ci_logs() {
+    sed -E \
+        -e 's#(Authorization:[[:space:]]*Bearer[[:space:]]+)[A-Za-z0-9._/+=-]+#\1<REDACTED>#gi' \
+        -e 's#(Authorization:[[:space:]]*Basic[[:space:]]+)[A-Za-z0-9+/=]+#\1<REDACTED>#gi' \
+        -e 's#(Bearer[[:space:]]+)[A-Za-z0-9._/+=-]{20,}#\1<REDACTED>#gi' \
+        -e 's#((api[_-]?key|apikey|access[_-]?token|auth[_-]?token|password|passwd|secret)["'\'':= ]+[\"]?)[A-Za-z0-9._/+=-]{8,}#\1<REDACTED>#gi' \
+        -e 's#(gh[oprsu]_)[A-Za-z0-9]{30,}#\1<REDACTED>#g' \
+        -e 's#(xox[abprs]-)[A-Za-z0-9-]{10,}#\1<REDACTED>#g' \
+        -e 's#(sk-(proj-)?)[A-Za-z0-9_-]{20,}#\1<REDACTED>#g' \
+        -e 's#(AKIA)[0-9A-Z]{16}#\1<REDACTED>#g' \
+        -e 's#(-----BEGIN[[:space:]]+[A-Z ]+[[:space:]]+PRIVATE[[:space:]]+KEY-----).*(-----END[[:space:]]+[A-Z ]+[[:space:]]+PRIVATE[[:space:]]+KEY-----)#\1<REDACTED>\2#g'
 }
 
 # ─── Per-repo PR scan ────────────────────────────────────────────────────
@@ -98,6 +147,12 @@ NOTIFY_BLOBS=()
 for REPO in $REPOS; do
     echo "$LOG_PREFIX Checking $REPO..."
 
+    # NB: ``comments(first: 100)`` — NOT 15. Long review threads (bot +
+    # human back-and-forth on a single finding) can exceed 20 comments and
+    # the orchestrator contract is "full thread context", not "first page".
+    # 100 is GitHub's max-per-page; anything beyond that we deliberately
+    # log a warning about below and rely on the orchestrator pulling the
+    # tail via the PR URL.
     PR_DATA=$(gh api graphql -f query="
     {
       repository(owner: \"${CLAWDBOT_GITHUB_OWNER}\", name: \"$(echo "$REPO" | cut -d/ -f2)\") {
@@ -116,7 +171,8 @@ for REPO in $REPOS; do
                 id
                 isResolved
                 isOutdated
-                comments(first: 15) {
+                comments(first: 100) {
+                  totalCount
                   nodes {
                     id
                     body
@@ -148,7 +204,15 @@ for REPO in $REPOS; do
           }
         }
       }
-    }" 2>/dev/null || echo '{"data":{"repository":{"pullRequests":{"nodes":[]}}}}')
+    }" 2>/dev/null) || {
+        # Fail closed: a GraphQL fetch failure without this guard produced an
+        # empty "no open PRs" response, which would then let the dev→main
+        # auto-create branch at the bottom of the loop fire even when
+        # feature PRs are actually in flight. Skipping the repo this tick
+        # is strictly safer — the next tick will retry.
+        echo "$LOG_PREFIX   ⚠️ GraphQL fetch failed for $REPO; skipping this tick" >&2
+        continue
+    }
 
     PR_LIST=$(echo "$PR_DATA" | jq -c '.data.repository.pullRequests.nodes[]' 2>/dev/null || true)
 
@@ -186,10 +250,22 @@ for REPO in $REPOS; do
             #   READY_MAIN     → notify Dmitri
             #   HAS_COMMENTS   → notify Sparky (after wait)
             #   CI_FAILED      → notify Sparky
-            #   NOT_READY      → waiting (pending CI, conflicts, drafts)
+            #   NOT_READY      → waiting (pending CI, conflicts, drafts,
+            #                            or PR targets a branch that is
+            #                            neither integration nor main)
             STATE=""
             if [ "$MERGEABLE" = "MERGEABLE" ] && [ "$CHECK_STATE" = "SUCCESS" ] && [ "$UNRESOLVED" -eq 0 ]; then
-                STATE=$([ "$PR_BASE" = "development" ] && echo "READY_DEV" || echo "READY_MAIN")
+                if [ "$PR_BASE" = "$INTEGRATION_BRANCH" ]; then
+                    STATE="READY_DEV"
+                elif [ "$PR_BASE" = "$MAIN_BRANCH" ]; then
+                    STATE="READY_MAIN"
+                else
+                    # PR targets some third branch (e.g. long-lived release
+                    # line). Don't auto-merge, don't notify — a human should
+                    # handle anything outside the two configured integration
+                    # points.
+                    STATE="NOT_READY"
+                fi
             elif [ "$UNRESOLVED" -gt 0 ]; then
                 STATE="HAS_COMMENTS"
             elif [ "$CHECK_STATE" = "FAILURE" ]; then
@@ -200,7 +276,7 @@ for REPO in $REPOS; do
 
             case "$STATE" in
                 READY_DEV)
-                    HAS_OPEN_DEV_MAIN=$(echo "$PR_DATA" | jq '[.data.repository.pullRequests.nodes[] | select(.baseRefName == "main" and .headRefName == "development")] | length')
+                    HAS_OPEN_DEV_MAIN=$(echo "$PR_DATA" | jq --arg integration "$INTEGRATION_BRANCH" --arg main "$MAIN_BRANCH" '[.data.repository.pullRequests.nodes[] | select(.baseRefName == $main and .headRefName == $integration)] | length')
                     if [ "$HAS_OPEN_DEV_MAIN" -gt 0 ]; then
                         echo "$LOG_PREFIX     ⏸️ Holding — open development→main PR exists"
                         MERGE_REASONS="${MERGE_REASONS}⏸️ Holding $PR_KEY (ready to merge to development) — open dev→main PR exists\n"
@@ -249,9 +325,9 @@ for REPO in $REPOS; do
                         continue
                     fi
 
-                    WAIT_CUTOFF=$(date -u -d "${REVIEW_WAIT_MINUTES} minutes ago" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)
+                    WAIT_CUTOFF=$(_iso_minutes_ago "$REVIEW_WAIT_MINUTES")
                     if [ -z "$WAIT_CUTOFF" ]; then
-                        echo "$LOG_PREFIX     ⚠️ 'date -d' failed; skipping this PR this tick" >&2
+                        echo "$LOG_PREFIX     ⚠️ review-wait cutoff computation failed; skipping this PR this tick (no notification, will retry next tick)" >&2
                         continue
                     fi
                     if [[ "$FIRST_SEEN" > "$WAIT_CUTOFF" ]]; then
@@ -260,8 +336,12 @@ for REPO in $REPOS; do
                     fi
 
                     if [ -n "$LAST_NOTIFIED" ]; then
-                        RENOTIFY_CUTOFF=$(date -u -d "${RENOTIFY_MINUTES} minutes ago" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)
-                        if [ -z "$RENOTIFY_CUTOFF" ] || [[ "$LAST_NOTIFIED" > "$RENOTIFY_CUTOFF" ]]; then
+                        RENOTIFY_CUTOFF=$(_iso_minutes_ago "$RENOTIFY_MINUTES")
+                        if [ -z "$RENOTIFY_CUTOFF" ]; then
+                            echo "$LOG_PREFIX     ⚠️ renotify cutoff computation failed; skipping re-notification this tick" >&2
+                            continue
+                        fi
+                        if [[ "$LAST_NOTIFIED" > "$RENOTIFY_CUTOFF" ]]; then
                             echo "$LOG_PREFIX     🔕 Already notified at this SHA (since $LAST_NOTIFIED), within ${RENOTIFY_MINUTES}m renotification cooldown"
                             continue
                         fi
@@ -295,9 +375,12 @@ for REPO in $REPOS; do
                               }
                         ]
                     }')
+                    # Attach the state-update coordinates so the delivery loop
+                    # below can mark "notified" only AFTER the wake succeeds.
+                    # A dropped wake that had already been marked notified
+                    # would suppress retries until RENOTIFY_MINUTES expires.
+                    PAYLOAD=$(echo "$PAYLOAD" | jq --arg key "$SHA_KEY" --arg ts "$NOW_ISO" '. + {_state_key: "notified_reviews", _state_sha_key: $key, _state_ts: $ts}')
                     NOTIFY_BLOBS+=("$PAYLOAD")
-                    jq --arg key "$SHA_KEY" --arg ts "$NOW_ISO" \
-                        '.notified_reviews[$key] = $ts' "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
                     echo "$LOG_PREFIX     📨 Queued notification to Sparky ($UNRESOLVED unresolved thread(s))"
                     ;;
 
@@ -306,8 +389,12 @@ for REPO in $REPOS; do
                     NOW_ISO=$(date -u +%Y-%m-%dT%H:%M:%SZ)
                     LAST_NOTIFIED=$(jq -r ".notified_ci[\"$SHA_KEY\"] // \"\"" "$STATE_FILE")
                     if [ -n "$LAST_NOTIFIED" ]; then
-                        RENOTIFY_CUTOFF=$(date -u -d "${RENOTIFY_MINUTES} minutes ago" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)
-                        if [ -z "$RENOTIFY_CUTOFF" ] || [[ "$LAST_NOTIFIED" > "$RENOTIFY_CUTOFF" ]]; then
+                        RENOTIFY_CUTOFF=$(_iso_minutes_ago "$RENOTIFY_MINUTES")
+                        if [ -z "$RENOTIFY_CUTOFF" ]; then
+                            echo "$LOG_PREFIX     ⚠️ renotify cutoff computation failed; skipping re-notification this tick" >&2
+                            continue
+                        fi
+                        if [[ "$LAST_NOTIFIED" > "$RENOTIFY_CUTOFF" ]]; then
                             echo "$LOG_PREFIX     🔕 Already notified of CI failure at this SHA (since $LAST_NOTIFIED)"
                             continue
                         fi
@@ -321,7 +408,7 @@ for REPO in $REPOS; do
                     if [ -n "$FAILED_JOBS" ]; then
                         while IFS='|' read -r RUN_ID RUN_NAME; do
                             [ -z "$RUN_ID" ] && continue
-                            JOB_LOG=$(gh run view "$RUN_ID" --repo "$REPO" --log-failed 2>/dev/null | tail -100 || true)
+                            JOB_LOG=$(gh run view "$RUN_ID" --repo "$REPO" --log-failed 2>/dev/null | tail -100 | _redact_ci_logs 2>/dev/null || true)
                             if [ -n "$JOB_LOG" ]; then
                                 FAILED_LOGS="${FAILED_LOGS}\n--- ${RUN_NAME} (run ${RUN_ID}) ---\n${JOB_LOG}\n"
                             fi
@@ -342,9 +429,8 @@ for REPO in $REPOS; do
                         ci_contexts: [.commits.nodes[0].commit.statusCheckRollup.contexts.nodes[]? | . as $ctx | if .__typename == "CheckRun" then {type:"check", name: $ctx.name, conclusion: $ctx.conclusion, status: $ctx.status} else {type:"status", name: $ctx.context, conclusion: $ctx.state} end],
                         failed_job_logs: $logs
                     }')
+                    PAYLOAD=$(echo "$PAYLOAD" | jq --arg key "$SHA_KEY" --arg ts "$NOW_ISO" '. + {_state_key: "notified_ci", _state_sha_key: $key, _state_ts: $ts}')
                     NOTIFY_BLOBS+=("$PAYLOAD")
-                    jq --arg key "$SHA_KEY" --arg ts "$NOW_ISO" \
-                        '.notified_ci[$key] = $ts' "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
                     echo "$LOG_PREFIX     📨 Queued CI-failure notification to Sparky"
                     ;;
 
@@ -363,36 +449,36 @@ for REPO in $REPOS; do
     fi
 
     # ─── Fast-forward development to main / create dev→main PR ─────────
-    MAIN_SHA=$(gh api "repos/$REPO/branches/main" --jq '.commit.sha' 2>/dev/null || echo "")
-    DEV_SHA=$(gh api "repos/$REPO/branches/development" --jq '.commit.sha' 2>/dev/null || echo "")
+    MAIN_SHA=$(gh api "repos/$REPO/branches/$MAIN_BRANCH" --jq '.commit.sha' 2>/dev/null || echo "")
+    DEV_SHA=$(gh api "repos/$REPO/branches/$INTEGRATION_BRANCH" --jq '.commit.sha' 2>/dev/null || echo "")
 
     if [ -n "$MAIN_SHA" ] && [ -n "$DEV_SHA" ] && [ "$MAIN_SHA" != "$DEV_SHA" ]; then
-        BEHIND=$(gh api "repos/$REPO/compare/development...main" --jq '.ahead_by' 2>/dev/null || echo "0")
-        AHEAD=$(gh api "repos/$REPO/compare/main...development" --jq '.ahead_by' 2>/dev/null || echo "0")
-        EXISTING_DEV_MAIN=$(gh pr list --repo "$REPO" --base main --head development --state open --json number --jq 'length' 2>/dev/null || echo "0")
+        BEHIND=$(gh api "repos/$REPO/compare/${INTEGRATION_BRANCH}...${MAIN_BRANCH}" --jq '.ahead_by' 2>/dev/null || echo "0")
+        AHEAD=$(gh api "repos/$REPO/compare/${MAIN_BRANCH}...${INTEGRATION_BRANCH}" --jq '.ahead_by' 2>/dev/null || echo "0")
+        EXISTING_DEV_MAIN=$(gh pr list --repo "$REPO" --base "$MAIN_BRANCH" --head "$INTEGRATION_BRANCH" --state open --json number --jq 'length' 2>/dev/null || echo "0")
 
         if [ "$BEHIND" -gt 0 ] && [ "$AHEAD" = "0" ] && [ "$EXISTING_DEV_MAIN" = "0" ]; then
-            echo "$LOG_PREFIX   ⏩ Fast-forwarding development to main ($BEHIND commits behind)..."
-            if gh api "repos/$REPO/git/refs/heads/development" -X PATCH -f sha="$MAIN_SHA" 2>/dev/null; then
-                echo "$LOG_PREFIX   ✅ development fast-forwarded to main"
-                MERGE_REASONS="${MERGE_REASONS}⏩ $REPO: development fast-forwarded to main\n"
+            echo "$LOG_PREFIX   ⏩ Fast-forwarding $INTEGRATION_BRANCH to $MAIN_BRANCH ($BEHIND commits behind)..."
+            if gh api "repos/$REPO/git/refs/heads/$INTEGRATION_BRANCH" -X PATCH -f sha="$MAIN_SHA" 2>/dev/null; then
+                echo "$LOG_PREFIX   ✅ $INTEGRATION_BRANCH fast-forwarded to $MAIN_BRANCH"
+                MERGE_REASONS="${MERGE_REASONS}⏩ $REPO: $INTEGRATION_BRANCH fast-forwarded to $MAIN_BRANCH\n"
             else
                 echo "$LOG_PREFIX   ⚠️ Fast-forward failed"
             fi
         elif [ "$AHEAD" -gt 0 ] && [ "$EXISTING_DEV_MAIN" = "0" ]; then
-            OPEN_FEATURE_TO_DEV=$(echo "$PR_DATA" | jq '[.data.repository.pullRequests.nodes[] | select(.baseRefName == "development" and .isDraft == false)] | length')
+            OPEN_FEATURE_TO_DEV=$(echo "$PR_DATA" | jq --arg integration "$INTEGRATION_BRANCH" '[.data.repository.pullRequests.nodes[] | select(.baseRefName == $integration and .isDraft == false)] | length')
             if [ "$OPEN_FEATURE_TO_DEV" -gt 0 ]; then
-                echo "$LOG_PREFIX   ⏸️ Not creating dev→main PR — $OPEN_FEATURE_TO_DEV open feature→development PR(s) still in flight"
+                echo "$LOG_PREFIX   ⏸️ Not creating ${INTEGRATION_BRANCH}→${MAIN_BRANCH} PR — $OPEN_FEATURE_TO_DEV open feature→${INTEGRATION_BRANCH} PR(s) still in flight"
             else
                 CREATED_SHA=$(jq -r ".created_dev_main_prs[\"$REPO\"] // \"\"" "$STATE_FILE")
                 if [ "$DEV_SHA" != "$CREATED_SHA" ]; then
-                    echo "$LOG_PREFIX   Creating development → main PR for $REPO ($AHEAD commits ahead)..."
-                    PR_RESULT=$(gh pr create --repo "$REPO" --base main --head development \
-                        --title "Development into main" \
-                        --body "Automated PR: development → main ($AHEAD commits ahead)" 2>&1 || true)
+                    echo "$LOG_PREFIX   Creating ${INTEGRATION_BRANCH} → ${MAIN_BRANCH} PR for $REPO ($AHEAD commits ahead)..."
+                    PR_RESULT=$(gh pr create --repo "$REPO" --base "$MAIN_BRANCH" --head "$INTEGRATION_BRANCH" \
+                        --title "${INTEGRATION_BRANCH} into ${MAIN_BRANCH}" \
+                        --body "Automated PR: ${INTEGRATION_BRANCH} → ${MAIN_BRANCH} ($AHEAD commits ahead)" 2>&1 || true)
                     if echo "$PR_RESULT" | grep -q "https://github.com"; then
                         PR_LINK=$(echo "$PR_RESULT" | grep -o "https://github.com[^ ]*")
-                        MERGE_REASONS="${MERGE_REASONS}🔀 Created development → main PR for $REPO ($AHEAD commits ahead)\n   $PR_LINK\n"
+                        MERGE_REASONS="${MERGE_REASONS}🔀 Created ${INTEGRATION_BRANCH} → ${MAIN_BRANCH} PR for $REPO ($AHEAD commits ahead)\n   $PR_LINK\n"
                         jq --arg repo "$REPO" --arg sha "$DEV_SHA" \
                             '.created_dev_main_prs[$repo] = $sha' "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
                     else
@@ -412,6 +498,9 @@ done
 for BLOB in "${NOTIFY_BLOBS[@]}"; do
     EVENT=$(echo "$BLOB" | jq -r '.event')
     PR_KEY=$(echo "$BLOB" | jq -r '.pr_key')
+    STATE_KEY=$(echo "$BLOB" | jq -r '._state_key // empty')
+    STATE_SHA_KEY=$(echo "$BLOB" | jq -r '._state_sha_key // empty')
+    STATE_TS=$(echo "$BLOB" | jq -r '._state_ts // empty')
 
     if [ "$EVENT" = "review_comments" ]; then
         HEADER="📝 pr-manager: $PR_KEY has $(echo "$BLOB" | jq '.unresolved_threads | length') unresolved review thread(s) and the ${REVIEW_WAIT_MINUTES}m wait window has elapsed."
@@ -421,10 +510,21 @@ for BLOB in "${NOTIFY_BLOBS[@]}"; do
         FOOTER="Review the failed_job_logs field, diagnose the root cause, plan the fix, then decide: fix inline or delegate to a swarm agent. Commit to the PR's head branch so CI re-runs."
     fi
 
-    # Pretty-print the envelope so Sparky sees readable JSON.
-    ENVELOPE=$(echo "$BLOB" | jq .)
+    # Strip the internal _state_* bookkeeping fields before rendering —
+    # the orchestrator only sees the public envelope shape documented in
+    # the header comment.
+    ENVELOPE=$(echo "$BLOB" | jq 'del(._state_key, ._state_sha_key, ._state_ts)')
     TEXT=$(printf '%s\n\n%s\n\n```json\n%s\n```' "$HEADER" "$FOOTER" "$ENVELOPE")
-    _wake_sparky "$TEXT"
+
+    if _wake_sparky "$TEXT"; then
+        # Only now mark the SHA as notified. A dropped wake stays "not
+        # notified" in state so the next tick retries immediately instead
+        # of waiting for RENOTIFY_MINUTES.
+        if [ -n "$STATE_KEY" ] && [ -n "$STATE_SHA_KEY" ] && [ -n "$STATE_TS" ]; then
+            jq --arg state_key "$STATE_KEY" --arg sha_key "$STATE_SHA_KEY" --arg ts "$STATE_TS" \
+                '.[$state_key][$sha_key] = $ts' "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+        fi
+    fi
 done
 
 # ─── Merge/notification events (PR-lifecycle bookkeeping, not reviews) ────
@@ -436,11 +536,19 @@ fi
 # ─── State hygiene ───────────────────────────────────────────────────────
 # Drop SHA-keyed entries older than 7 days (per-commit bookkeeping only
 # needs to live until the next rebase/force-push at most).
-CUTOFF_7D=$(date -u -d "7 days ago" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)
-jq --arg cutoff "$CUTOFF_7D" '
-  .first_seen_unresolved = (.first_seen_unresolved // {} | to_entries | map(select(.value > $cutoff)) | from_entries)
-  | .notified_reviews = (.notified_reviews // {} | to_entries | map(select(.value > $cutoff)) | from_entries)
-  | .notified_ci = (.notified_ci // {} | to_entries | map(select(.value > $cutoff)) | from_entries)
-' "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+# 7-day cutoff. If the portable ``_iso_minutes_ago`` fails for some reason
+# we skip the prune entirely instead of the pre-refactor behaviour of
+# falling back to *now*, which would delete every state entry on every
+# tick and effectively reset wait/renotify bookkeeping.
+CUTOFF_7D=$(jq -rn 'now - 604800 | strftime("%Y-%m-%dT%H:%M:%SZ")' 2>/dev/null || true)
+if [ -z "$CUTOFF_7D" ]; then
+    echo "$LOG_PREFIX ⚠️ 7-day cutoff computation failed; skipping state housekeeping this tick" >&2
+else
+    jq --arg cutoff "$CUTOFF_7D" '
+      .first_seen_unresolved = (.first_seen_unresolved // {} | to_entries | map(select(.value > $cutoff)) | from_entries)
+      | .notified_reviews = (.notified_reviews // {} | to_entries | map(select(.value > $cutoff)) | from_entries)
+      | .notified_ci = (.notified_ci // {} | to_entries | map(select(.value > $cutoff)) | from_entries)
+    ' "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+fi
 
 echo "$LOG_PREFIX Done."

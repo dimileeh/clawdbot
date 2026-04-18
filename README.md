@@ -27,12 +27,16 @@ swarm-monitor.sh (*/3 cron) ──── check-agents.sh
    ├── conflict?         → wake orchestrator to rebase
    └── nothing changed?  → exit silently (zero cost)
    
-pr-manager.sh (*/10 cron)
+pr-manager.sh (*/5 cron)
    │
    ├── auto-merge safe integration PRs
-   ├── spawn review-fix agents for unresolved threads
-   ├── spawn CI-fix agents for failing checks
+   ├── wake Sparky with structured JSON when a PR has unresolved review comments
+   ├── wake Sparky with failed-job logs when CI is red
    └── open integration→main sync PRs when queue drains
+
+Sparky (the OpenClaw orchestrator) then aggregates, plans, and decides
+whether to fix inline or delegate to a swarm agent. Bash never spawns
+fix agents directly.
 
 human reviews and merges main-targeted PRs
 ```
@@ -132,8 +136,8 @@ crontab -e
 # Agent pre-check (validate GitHub API, repos accessible)
 */10 * * * * /home/YOU/.clawdbot/agent-precheck.sh >> /home/YOU/.clawdbot/logs/precheck.log 2>&1
 
-# PR manager (merge, review-fix, sync PRs)
-*/10 * * * * /home/YOU/.clawdbot/pr-manager.sh >> /home/YOU/.clawdbot/logs/pr-manager.log 2>&1
+# PR manager (merge, notify Sparky on comments / CI failures, sync PRs)
+*/5 * * * * /home/YOU/.clawdbot/pr-manager.sh >> /home/YOU/.clawdbot/logs/pr-manager.log 2>&1
 
 # Swarm monitor (zero-LLM, wakes orchestrator only on events)
 */3 * * * * /home/YOU/.clawdbot/swarm-monitor.sh

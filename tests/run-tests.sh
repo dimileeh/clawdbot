@@ -116,17 +116,32 @@ for var in $USED_VARS; do
 done
 echo ""
 
-# ─── Layer 5: pr-manager PR classifier logic ───────────────────────────
+# ─── Layer 5: pr-manager PR classifier logic ───────────────────────
 #
 # pr-manager.sh maps (mergeable, check_state, unresolved, base) into one of
 # five terminal STATE values. These tests pin that mapping independently of
 # the rest of the script so future refactors cannot silently flip a case.
+#
+# Branch names are honoured via INTEGRATION_BRANCH / MAIN_BRANCH, matching
+# the CLAWDBOT_INTEGRATION_BRANCH / CLAWDBOT_MAIN_BRANCH env vars the
+# script reads at startup. Defaults are development / main but teams can
+# override, so the classifier must not hardcode those names — and neither
+# must these fixtures.
 echo "Layer 5: pr-manager classifier logic"
+
+INTEGRATION_BRANCH="${CLAWDBOT_INTEGRATION_BRANCH:-development}"
+MAIN_BRANCH="${CLAWDBOT_MAIN_BRANCH:-main}"
 
 classify() {
     local mergeable="$1" check_state="$2" unresolved="$3" base="$4"
     if [ "$mergeable" = "MERGEABLE" ] && [ "$check_state" = "SUCCESS" ] && [ "$unresolved" -eq 0 ]; then
-        [ "$base" = "development" ] && echo "READY_DEV" || echo "READY_MAIN"
+        if [ "$base" = "$INTEGRATION_BRANCH" ]; then
+            echo "READY_DEV"
+        elif [ "$base" = "$MAIN_BRANCH" ]; then
+            echo "READY_MAIN"
+        else
+            echo "NOT_READY"
+        fi
     elif [ "$unresolved" -gt 0 ]; then
         echo "HAS_COMMENTS"
     elif [ "$check_state" = "FAILURE" ]; then
@@ -145,15 +160,26 @@ expect_state() {
     fi
 }
 
-expect_state "$(classify MERGEABLE SUCCESS 0 development)" READY_DEV "clean dev PR"
-expect_state "$(classify MERGEABLE SUCCESS 0 main)" READY_MAIN "clean main PR"
-expect_state "$(classify MERGEABLE SUCCESS 3 development)" HAS_COMMENTS "dev PR with comments"
-expect_state "$(classify MERGEABLE SUCCESS 1 main)" HAS_COMMENTS "main PR with comments"
-expect_state "$(classify MERGEABLE FAILURE 0 development)" CI_FAILED "clean threads + failed CI"
-expect_state "$(classify MERGEABLE FAILURE 2 development)" HAS_COMMENTS "comments beat CI failure in priority"
-expect_state "$(classify MERGEABLE PENDING 0 development)" NOT_READY "CI still running"
-expect_state "$(classify CONFLICTING SUCCESS 0 development)" NOT_READY "merge conflict"
-expect_state "$(classify CONFLICTING FAILURE 5 development)" HAS_COMMENTS "comments win over everything else"
+expect_state "$(classify MERGEABLE SUCCESS 0 "$INTEGRATION_BRANCH")" READY_DEV "clean integration PR"
+expect_state "$(classify MERGEABLE SUCCESS 0 "$MAIN_BRANCH")" READY_MAIN "clean main PR"
+expect_state "$(classify MERGEABLE SUCCESS 0 "release/1.0")" NOT_READY "clean PR targeting third branch"
+expect_state "$(classify MERGEABLE SUCCESS 3 "$INTEGRATION_BRANCH")" HAS_COMMENTS "integration PR with comments"
+expect_state "$(classify MERGEABLE SUCCESS 1 "$MAIN_BRANCH")" HAS_COMMENTS "main PR with comments"
+expect_state "$(classify MERGEABLE FAILURE 0 "$INTEGRATION_BRANCH")" CI_FAILED "clean threads + failed CI"
+expect_state "$(classify MERGEABLE FAILURE 2 "$INTEGRATION_BRANCH")" HAS_COMMENTS "comments beat CI failure in priority"
+expect_state "$(classify MERGEABLE PENDING 0 "$INTEGRATION_BRANCH")" NOT_READY "CI still running"
+expect_state "$(classify CONFLICTING SUCCESS 0 "$INTEGRATION_BRANCH")" NOT_READY "merge conflict"
+expect_state "$(classify CONFLICTING FAILURE 5 "$INTEGRATION_BRANCH")" HAS_COMMENTS "comments win over everything else"
+
+# Exercise the configurable-branch path explicitly by overriding the names
+# to simulate a team on trunk-based or staging/prod conventions.
+(
+    INTEGRATION_BRANCH="trunk"
+    MAIN_BRANCH="prod"
+    expect_state "$(classify MERGEABLE SUCCESS 0 trunk)" READY_DEV "custom: trunk → READY_DEV"
+    expect_state "$(classify MERGEABLE SUCCESS 0 prod)"  READY_MAIN "custom: prod → READY_MAIN"
+    expect_state "$(classify MERGEABLE SUCCESS 0 development)" NOT_READY "custom: stock 'development' not auto-merged when renamed"
+)
 echo ""
 
 # ─── Layer 5b: review wait window + renotification logic ───────────────────
@@ -273,7 +299,81 @@ if [ "$(echo "$ENVELOPE" | jq '.ci_contexts | length')" = "2" ]; then
 else
     fail "envelope: ci_contexts count wrong"
 fi
+
+# ci_failed envelope: same base shape but tagged event, plus a
+# failed_job_logs string field instead of unresolved_threads. We use a
+# single-line fixture here because jq --arg and the surrounding $() command
+# substitution each normalize trailing newlines differently; the redaction
+# + assembly code in pr-manager.sh doesn't depend on newline preservation.
+CI_LOGS='--- lint-and-test (run 123) --- E ruff check failed'
+CI_ENVELOPE=$(echo "$SYNTH_PR" | jq --arg repo "o/r" --arg pr_key "o/r#42" --arg sha "abc" --arg check_state "FAILURE" --arg logs "$CI_LOGS" '{
+    event: "ci_failed",
+    pr_key: $pr_key,
+    repo: $repo,
+    number: .number,
+    title: .title,
+    url: .url,
+    head: .headRefName,
+    base: .baseRefName,
+    head_sha: $sha,
+    ci_status: $check_state,
+    ci_contexts: [.commits.nodes[0].commit.statusCheckRollup.contexts.nodes[]? | . as $ctx | if .__typename == "CheckRun" then {type:"check", name: $ctx.name, conclusion: $ctx.conclusion, status: $ctx.status} else {type:"status", name: $ctx.context, conclusion: $ctx.state} end],
+    failed_job_logs: $logs
+}')
+if echo "$CI_ENVELOPE" | jq -e '.event == "ci_failed"' >/dev/null; then
+    pass "ci_failed envelope: event tag correct"
+else
+    fail "ci_failed envelope: event tag missing or wrong"
+fi
+if echo "$CI_ENVELOPE" | jq -e 'has("unresolved_threads") | not' >/dev/null; then
+    pass "ci_failed envelope: no unresolved_threads field"
+else
+    fail "ci_failed envelope: should not carry unresolved_threads"
+fi
+if [ "$(echo "$CI_ENVELOPE" | jq -r '.failed_job_logs')" = "$CI_LOGS" ]; then
+    pass "ci_failed envelope: failed_job_logs preserved byte-for-byte"
+else
+    fail "ci_failed envelope: failed_job_logs mutated"
+fi
+if [ "$(echo "$CI_ENVELOPE" | jq -r '.ci_status')" = "FAILURE" ]; then
+    pass "ci_failed envelope: ci_status surfaces FAILURE"
+else
+    fail "ci_failed envelope: ci_status wrong"
+fi
 echo ""
+
+# ─── Layer 5d: CI log redaction ──────────────────────────────────
+echo "Layer 5d: CI log redaction"
+
+# Source the redactor from pr-manager.sh so this test exercises the real
+# function, not a reimplementation.
+eval "$(awk '/^_redact_ci_logs\(\) \{/,/^\}/' "$REPO_DIR/pr-manager.sh")"
+
+assert_redacted() {
+    local label="$1" input="$2" must_not_contain="$3"
+    local got
+    got=$(printf '%s\n' "$input" | _redact_ci_logs)
+    if echo "$got" | grep -q -- "$must_not_contain"; then
+        fail "redactor: $label leaked '$must_not_contain' → $got"
+    else
+        pass "redactor: $label"
+    fi
+}
+
+assert_redacted "Bearer token"        "Authorization: Bearer sk-proj-abcdefghijklmnopqrstuvwxyz1234" "sk-proj-abcdefghij"
+assert_redacted "gh PAT"              "token=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789" "ghp_ABCDEFGHIJ"
+assert_redacted "Slack xoxb"          "webhook failed: xoxb-1234567890-ABCDEFG-abcdefghijklmnop" "xoxb-1234567890-ABCDEFG"
+assert_redacted "api_key= form"       'headers: api_key="supersecrettoken123"' "supersecrettoken123"
+assert_redacted "password= form"      'dsn: password=hunter2hunter2hunter2' "hunter2hunter2hunter2"
+assert_redacted "AWS access key"      "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE" "AKIAIOSFODNN7EXAMPLE"
+
+# Non-secret text must pass through untouched.
+NOSEC="normal log line with no secrets"
+if [ "$(echo "$NOSEC" | _redact_ci_logs)" = "$NOSEC" ]; then
+    pass "redactor: plain log line passes through unchanged"
+else
+    fail "redactor: plain log line was mutated"
+fi
 echo ""
 
 # ─── Layer 6: No hardcoded PII ────────────────────────────────────────────
