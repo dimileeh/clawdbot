@@ -148,9 +148,13 @@ _announce_to_maintainer() {
         echo "$LOG_PREFIX ⚠️ CLAWDBOT_NOTIFY_TARGET not set; cannot announce to maintainer" >&2
         return 1
     fi
+    # ``openclaw message send`` takes ``--target``, not ``--to`` (unlike
+    # ``openclaw cron add`` which takes ``--to``). Mismatch shipped in PR #24
+    # as the helper was never tested against the real merge/no-op delivery
+    # path; caught during post-PR#26 re-enable dry-tick.
     if openclaw message send \
         --channel "$HANDLER_CHANNEL" \
-        --to "$HANDLER_TARGET" \
+        --target "$HANDLER_TARGET" \
         --message "$text" >/dev/null 2>&1; then
         return 0
     fi
