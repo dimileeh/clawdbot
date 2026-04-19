@@ -132,13 +132,20 @@ HANDLER_THINKING="${CLAWDBOT_HANDLER_THINKING:-high}"
 # Thread-count ceiling for inline (handler-owned) fixes — above this
 # the bash script escalates directly to the maintainer instead of
 # paying for an LLM spawn (gemini _BbKB, clawdbot#26). Raised from 7
-# to 20 on 2026-04-19 (clawdbot#??): the envelope-via-file refactor
-# (clawdbot#31) made handlers much more robust on big review batches
-# so aggregate dev→main PRs with ~10 bot findings can be handled
-# inline instead of bouncing to the maintainer. The ceiling is still
-# present because >20-thread PRs signal orchestration work (multiple
-# distinct design issues) that deserves human triage, not a single
-# handler run.
+# to 20 on 2026-04-19 (clawdbot#31): the envelope-robustness work in
+# clawdbot#26 — labeled single-line ``ENVELOPE:<json>`` delivery plus
+# ``jq -c`` compact serialization that strips whitespace before the
+# payload reaches ``openclaw cron add --message`` — removed both the
+# nested-fence truncation trap AND brings the command-line argument
+# well under typical ``ARG_MAX`` for realistic review batches, so
+# aggregate dev→main PRs with ~10 bot findings can be handled inline
+# instead of bouncing to the maintainer. (An envelope-via-file mode
+# is a plausible future refactor if we ever need to deliver payloads
+# that risk E2BIG, but it's explicitly NOT what this ceiling bump
+# relies on — the current inline-string path is the one that ships.)
+# The ceiling stays because >20-thread PRs signal orchestration work
+# (multiple distinct design issues) that deserves human triage, not
+# a single handler run.
 HANDLER_MAX_INLINE_THREADS=$(_parse_positive_int "${CLAWDBOT_HANDLER_MAX_INLINE_THREADS:-20}" 20 CLAWDBOT_HANDLER_MAX_INLINE_THREADS)
 HANDLER_CHANNEL="${CLAWDBOT_NOTIFY_CHANNEL:-telegram}"
 HANDLER_TARGET="${CLAWDBOT_NOTIFY_TARGET:-}"
