@@ -1,6 +1,6 @@
 ---
 name: pr-review-hygiene
-description: "Rules for the orchestrator (the LLM driving clawdbot) when it acts on pr-manager wake events. Covers the review-reply-resolve loop, when to fix inline vs delegate to a swarm agent, when NOT to resolve a thread, and how to avoid lagging behind fresh review-bot comments. Use when: handling any `📝 pr-manager: ... unresolved review thread(s)` or `🔴 pr-manager: ... failed CI run` structured event, OR when replying to review bots on a PR you own."
+description: "Rules for the orchestrator (the LLM driving clawdbot) when it acts on pr-manager wake events. Covers Rule 0 (act on every wake — review_comments, ci_failed, merge/no-op reports, anything — in the same turn, relaying merge/no-op reports to the human by default), the review-reply-resolve loop, when to fix inline vs delegate to a swarm agent, when NOT to resolve a thread, and how to avoid lagging behind fresh review-bot comments. Use when: handling any `📝 pr-manager: ... unresolved review thread(s)`, `🔴 pr-manager: ... failed CI run`, or `🔧 PR Manager report` (merge / no-op) structured event, OR when replying to review bots on a PR you own."
 metadata:
   { "openclaw": { "emoji": "🔎" } }
 ---
@@ -31,7 +31,7 @@ What does **not** count as acting:
 
 Failure mode this prevents: the agent handles an initial wake batch, then ignores several subsequent wakes for hours while the human sleeps — catching up only after review bots have piled on follow-up comments. The human sees the unresolved threads on GitHub before the agent does, and loses trust in the automation.
 
-**The rule is immediate:** pr-manager wakes you, you act or explain in the same turn. Silence is never the right response to a pr-manager envelope that contains unresolved work.
+**The rule is immediate:** pr-manager wakes you, you act or explain in the same turn. Silence is never the right response to a pr-manager envelope.
 
 ## The loop
 
