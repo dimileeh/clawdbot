@@ -129,6 +129,13 @@ HANDLER_TIMEOUT_SECONDS=$(_parse_positive_int "${CLAWDBOT_HANDLER_TIMEOUT_SECOND
 # accepts off|minimal|low|medium|high|xhigh; anything else fails at
 # spawn time, so we let openclaw validate rather than shadow its list.
 HANDLER_THINKING="${CLAWDBOT_HANDLER_THINKING:-high}"
+# Thread-count ceiling for inline (handler-owned) fixes — above this
+# the bash script escalates directly to the maintainer instead of
+# paying for an LLM spawn (gemini _BbKB, clawdbot#26). Observed on
+# 2026-04-19: a 15-thread aggregate PR exhausted the handler's
+# context + hit retry/abort loops. 7 is a conservative ceiling; the
+# handler can still fix up to that many surgical finds.
+HANDLER_MAX_INLINE_THREADS=$(_parse_positive_int "${CLAWDBOT_HANDLER_MAX_INLINE_THREADS:-7}" 7 CLAWDBOT_HANDLER_MAX_INLINE_THREADS)
 HANDLER_CHANNEL="${CLAWDBOT_NOTIFY_CHANNEL:-telegram}"
 HANDLER_TARGET="${CLAWDBOT_NOTIFY_TARGET:-}"
 
@@ -148,6 +155,28 @@ _announce_to_maintainer() {
         return 0
     fi
     echo "$LOG_PREFIX ⚠️ Failed to announce to maintainer; state not marked notified, will retry next tick" >&2
+    return 1
+}
+
+# Wake the main orchestrator session (Sparky) with a system event. This
+# mirrors the handler-runtime \`\`sessions_send\`\` escalation path the
+# pr-review-hygiene skill documents — for bash-level short-circuits
+# (oversized thread aggregates) we call this directly so Sparky gets
+# explicitly notified, not just the maintainer's Telegram.
+#
+# The skill requires escalation messages to start with
+# \`\`[ESCALATION] <pr_key>\`\`; callers are responsible for preserving
+# that contract. \`\`--mode now\`\` enqueues immediately and triggers a
+# heartbeat so Sparky picks up the event on her next tick.
+_wake_main_session() {
+    local text="$1"
+    if openclaw system event \
+        --mode now \
+        --text "$text" \
+        --timeout 5000 >/dev/null 2>&1; then
+        return 0
+    fi
+    echo "$LOG_PREFIX ⚠️ Failed to wake main session; state not marked notified, will retry next tick" >&2
     return 1
 }
 
@@ -609,21 +638,100 @@ for BLOB in "${NOTIFY_BLOBS[@]}"; do
     STATE_TS=$(echo "$BLOB" | jq -r '._state_ts // empty')
 
     if [ "$EVENT" = "review_comments" ]; then
-        HEADER="📝 PR handler: $PR_KEY has $(echo "$BLOB" | jq '.unresolved_threads | length') unresolved review thread(s) and the ${REVIEW_WAIT_MINUTES}m wait window has elapsed."
-        FOOTER="You are an isolated handler subagent. Read the \`pr-review-hygiene\` skill first, then own this PR end-to-end: aggregate the comments by theme + severity, write a short plan, fix inline for surgical changes or delegate to a swarm agent for larger refactors. Commits land on the PR's head branch via the pr-worktree pattern (\`~/pr-work/<repo>/pr-<N>/\`). Reply + resolve each thread when done. Report a concise completion summary at the end. Escalate to the main session via \`sessions_send\` with an \`[ESCALATION]\` prefix only if a product/design decision is required."
+        THREAD_COUNT=$(echo "$BLOB" | jq '.unresolved_threads | length')
+
+        # Thread-count escalation gate (gemini _BbKB). A PR with more than
+        # HANDLER_MAX_INLINE_THREADS unresolved threads is orchestration
+        # work, not surgical review-fix work — handlers that tried to
+        # chew through 15-thread envelopes on 2026-04-19 hit token/abort
+        # loops mid-run. Short-circuit in bash instead of paying for an
+        # LLM spawn whose only job is to count and exit.
+        #
+        # Two-channel delivery (coderabbit _BgUR, clawdbot#26 round 2).
+        # Telegram alone is fire-and-forget — the maintainer sees it but
+        # the main orchestrator session (Sparky) stays unaware, which
+        # violates the documented ``sessions_send`` escalation contract
+        # in the pr-review-hygiene skill. So we BOTH announce to the
+        # maintainer AND wake Sparky. State is only marked notified when
+        # both deliveries succeed — a partial failure leaves the SHA
+        # "not notified" so the next tick retries.
+        if [ "$THREAD_COUNT" -gt "$HANDLER_MAX_INLINE_THREADS" ]; then
+            PR_URL=$(echo "$BLOB" | jq -r '.url')
+            THREAD_IDS=$(echo "$BLOB" | jq -r '[.unresolved_threads[].thread_id] | join(",")')
+            ESCALATION_MSG=$(printf '[ESCALATION] %s has %s unresolved review thread(s) — above the inline-handler threshold (%s). Aggregate review PRs are orchestration work. threads=%s url=%s' \
+                "$PR_KEY" "$THREAD_COUNT" "$HANDLER_MAX_INLINE_THREADS" "$THREAD_IDS" "$PR_URL")
+            echo "$LOG_PREFIX     🚨 Thread count $THREAD_COUNT > $HANDLER_MAX_INLINE_THREADS; escalating to maintainer + main session (no handler spawn)"
+            ANNOUNCE_OK=0
+            WAKE_OK=0
+            _announce_to_maintainer "$ESCALATION_MSG" && ANNOUNCE_OK=1
+            _wake_main_session       "$ESCALATION_MSG" && WAKE_OK=1
+            if [ "$ANNOUNCE_OK" -eq 1 ] && [ "$WAKE_OK" -eq 1 ]; then
+                if [ -n "$STATE_KEY" ] && [ -n "$STATE_SHA_KEY" ] && [ -n "$STATE_TS" ]; then
+                    jq --arg state_key "$STATE_KEY" --arg sha_key "$STATE_SHA_KEY" --arg ts "$STATE_TS" \
+                        '.[$state_key][$sha_key] = $ts' "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+                fi
+            else
+                echo "$LOG_PREFIX     ⚠️ Escalation partial (announce=$ANNOUNCE_OK wake=$WAKE_OK); not marking notified, will retry next tick" >&2
+            fi
+            continue
+        fi
+
+        HEADER="📝 PR handler: $PR_KEY has $THREAD_COUNT unresolved review thread(s) and the ${REVIEW_WAIT_MINUTES}m wait window has elapsed."
+        FOOTER="You are an isolated handler subagent. Read the pr-review-hygiene skill first, then own this PR end-to-end via the pr-worktree pattern (~/pr-work/<repo>/pr-<N>/): commit fixes, push, reply + resolve each thread.
+
+INSTRUCTIONS
+
+1. Read pr-review-hygiene skill BEFORE touching the PR.
+2. Parse the ENVELOPE JSON below.
+3. Emit ZERO intermediate assistant text. Every assistant message gets announced to the maintainer's Telegram, so intermediate 'Now let me...' narrations spam the chat. Do all reasoning silently via tool-use. Produce exactly ONE final text reply at the end.
+4. Escalate via sessions_send to main label='main' for any product/design call you can't make unilaterally. The escalation message MUST start with '[ESCALATION] ${PR_KEY} ' and include the affected thread_ids so the main session knows which PR and which threads you couldn't handle.
+
+Completion summary template (final reply — success path):
+PR ${PR_KEY} head=<new_sha>: <N> threads resolved, <M> deferred. <one-line net code change>. CI: <status>.
+
+Completion summary template (final reply — escalation path):
+[ESCALATION] ${PR_KEY} <reason>. threads=<comma-separated thread_ids>."
     else
         HEADER="🔴 PR handler: $PR_KEY has a failed CI run (all review threads resolved)."
-        FOOTER="You are an isolated handler subagent. Read the \`pr-review-hygiene\` skill first, then own this PR end-to-end: review the failed_job_logs field, diagnose the root cause, plan the fix. Commit to the PR's head branch via the pr-worktree pattern (\`~/pr-work/<repo>/pr-<N>/\`) so CI re-runs. Report a concise completion summary at the end. Escalate to the main session via \`sessions_send\` with an \`[ESCALATION]\` prefix only if the failure is infra-level (not a code bug) or requires a design call."
+        FOOTER="You are an isolated handler subagent. Read the pr-review-hygiene skill first, then fix the failed CI via the pr-worktree pattern (~/pr-work/<repo>/pr-<N>/).
+
+INSTRUCTIONS
+
+1. Read pr-review-hygiene skill BEFORE touching the PR.
+2. Parse the ENVELOPE JSON below. failed_job_logs has the tail of the red job.
+3. Emit ZERO intermediate assistant text. Every assistant message gets announced to the maintainer's Telegram, so narrations spam the chat. Do all reasoning silently via tool-use. Produce exactly ONE final text reply at the end.
+4. Escalate via sessions_send to main label='main' if the failure is infra-level (not a code bug) or requires a design call. The escalation message MUST start with '[ESCALATION] ${PR_KEY} ' so the main session can route it.
+
+Completion summary template (final reply — success path):
+PR ${PR_KEY} head=<new_sha>: CI fixed by <one-line change>. New run: <status>.
+
+Completion summary template (final reply — escalation path):
+[ESCALATION] ${PR_KEY} <infra-level or design reason>."
     fi
 
-    # Strip the internal _state_* bookkeeping fields before rendering —
-    # the handler subagent only sees the public envelope shape documented
-    # in the header comment. ``jq -c`` (compact output, gemini _EcA)
-    # trims a ~3x whitespace overhead from the serialised envelope so
-    # long review threads don't risk hitting E2BIG when the payload is
-    # passed to ``openclaw cron add --message``.
+    # Strip the internal _state_* bookkeeping fields before rendering.
+    # ``jq -c`` (compact output, gemini _EcA) trims whitespace so long
+    # review threads don't risk hitting E2BIG when the payload is passed
+    # to ``openclaw cron add --message`` (still enforced in #26).
     ENVELOPE=$(echo "$BLOB" | jq -c 'del(._state_key, ._state_sha_key, ._state_ts)')
-    TEXT=$(printf '%s\n\n%s\n\n```json\n%s\n```' "$HEADER" "$FOOTER" "$ENVELOPE")
+
+    # Envelope is delivered as a labeled single-line ``ENVELOPE:<json>`` row
+    # rather than a markdown ```json fenced block. Review-bot comment
+    # bodies routinely contain nested ```typescript / ```diff fences
+    # (cursor, coderabbit, gemini all embed code suggestions), and when
+    # the outer ```json envelope gets re-rendered by the subagent's chat
+    # extractor, the first nested ``` is mistaken for the closing fence.
+    # That truncates the JSON mid-body and the subagent hits a
+    # ``Expected double-quoted property name`` parse error at position
+    # ~80-1080, with no way to recover. A labeled single line has no
+    # nested-delimiter ambiguity — whatever parser the subagent uses
+    # reads the whole rest of the line as the payload. (PR #24 shipped
+    # the fenced form; #26 fixes the nested-fence trap.)
+    #
+    # Trailing ``\n`` (gemini _BbKE) keeps the final line terminated for
+    # line-oriented tools that downstream tooling may pipe the message
+    # through (``grep``, ``awk``, ``tail -f``, etc).
+    TEXT=$(printf '%s\n\n%s\n\nENVELOPE: %s\n' "$HEADER" "$FOOTER" "$ENVELOPE")
 
     if _spawn_handler_subagent "$EVENT" "$PR_KEY" "$TEXT"; then
         echo "$LOG_PREFIX 🤖 Spawned handler subagent for $PR_KEY ($EVENT)"
