@@ -586,15 +586,37 @@ for REPO in $REPOS; do
     fi
 
     # ─── Fast-forward development to main / create dev→main PR ─────────
-    MAIN_SHA=$(gh api "repos/$REPO/branches/$MAIN_BRANCH" --jq '.commit.sha' 2>/dev/null || echo "")
-    DEV_SHA=$(gh api "repos/$REPO/branches/$INTEGRATION_BRANCH" --jq '.commit.sha' 2>/dev/null || echo "")
+    # Validate the SHA lookups landed a real 40-char hex before proceeding.
+    # When a branch doesn't exist on the remote (e.g. a fresh clone whose
+    # integration branch was never pushed) the gh api call returns a JSON
+    # 404 body, and ``--jq '.commit.sha'`` evaluates to ``null`` (printed
+    # empty by ``-r``) OR the raw body slips through on some failure
+    # modes. Either way the ``$MAIN_SHA != $DEV_SHA`` string comparison
+    # that follows would accidentally proceed against garbage and the
+    # downstream integer comparisons would blow up with non-integer
+    # values. A strict hex regex here keeps the fast-forward / PR-create
+    # branch strictly gated on real branch state.
+    MAIN_SHA=$(gh api "repos/$REPO/branches/$MAIN_BRANCH" --jq '.commit.sha' 2>/dev/null || true)
+    DEV_SHA=$(gh api "repos/$REPO/branches/$INTEGRATION_BRANCH" --jq '.commit.sha' 2>/dev/null || true)
+    [[ "$MAIN_SHA" =~ ^[0-9a-f]{40}$ ]] || MAIN_SHA=""
+    [[ "$DEV_SHA"  =~ ^[0-9a-f]{40}$ ]] || DEV_SHA=""
 
     if [ -n "$MAIN_SHA" ] && [ -n "$DEV_SHA" ] && [ "$MAIN_SHA" != "$DEV_SHA" ]; then
-        BEHIND=$(gh api "repos/$REPO/compare/${INTEGRATION_BRANCH}...${MAIN_BRANCH}" --jq '.ahead_by' 2>/dev/null || echo "0")
-        AHEAD=$(gh api "repos/$REPO/compare/${MAIN_BRANCH}...${INTEGRATION_BRANCH}" --jq '.ahead_by' 2>/dev/null || echo "0")
-        EXISTING_DEV_MAIN=$(gh pr list --repo "$REPO" --base "$MAIN_BRANCH" --head "$INTEGRATION_BRANCH" --state open --json number --jq 'length' 2>/dev/null || echo "0")
+        # Same defensive pattern for the ahead/behind counts: we already
+        # know both refs resolve, but a transient 404 on the ``compare``
+        # endpoint (observed 2026-04-19 mid-refactor) returned a JSON
+        # body that then fell through ``|| echo "0"`` and ended up
+        # inside a ``[ "$BEHIND" -gt 0 ]`` test, producing the bash
+        # "integer expression expected" error and silent action-skip.
+        # Force a ``0`` fallback on any non-digit output.
+        BEHIND=$(gh api "repos/$REPO/compare/${INTEGRATION_BRANCH}...${MAIN_BRANCH}" --jq '.ahead_by' 2>/dev/null || true)
+        AHEAD=$(gh api "repos/$REPO/compare/${MAIN_BRANCH}...${INTEGRATION_BRANCH}" --jq '.ahead_by' 2>/dev/null || true)
+        EXISTING_DEV_MAIN=$(gh pr list --repo "$REPO" --base "$MAIN_BRANCH" --head "$INTEGRATION_BRANCH" --state open --json number --jq 'length' 2>/dev/null || true)
+        [[ "$BEHIND" =~ ^[0-9]+$ ]] || BEHIND=0
+        [[ "$AHEAD" =~ ^[0-9]+$ ]] || AHEAD=0
+        [[ "$EXISTING_DEV_MAIN" =~ ^[0-9]+$ ]] || EXISTING_DEV_MAIN=0
 
-        if [ "$BEHIND" -gt 0 ] && [ "$AHEAD" = "0" ] && [ "$EXISTING_DEV_MAIN" = "0" ]; then
+        if [ "$BEHIND" -gt 0 ] && [ "$AHEAD" -eq 0 ] && [ "$EXISTING_DEV_MAIN" -eq 0 ]; then
             echo "$LOG_PREFIX   ⏩ Fast-forwarding $INTEGRATION_BRANCH to $MAIN_BRANCH ($BEHIND commits behind)..."
             if gh api "repos/$REPO/git/refs/heads/$INTEGRATION_BRANCH" -X PATCH -f sha="$MAIN_SHA" 2>/dev/null; then
                 echo "$LOG_PREFIX   ✅ $INTEGRATION_BRANCH fast-forwarded to $MAIN_BRANCH"
@@ -602,7 +624,7 @@ for REPO in $REPOS; do
             else
                 echo "$LOG_PREFIX   ⚠️ Fast-forward failed"
             fi
-        elif [ "$AHEAD" -gt 0 ] && [ "$EXISTING_DEV_MAIN" = "0" ]; then
+        elif [ "$AHEAD" -gt 0 ] && [ "$EXISTING_DEV_MAIN" -eq 0 ]; then
             OPEN_FEATURE_TO_DEV=$(echo "$PR_DATA" | jq --arg integration "$INTEGRATION_BRANCH" '[.data.repository.pullRequests.nodes[] | select(.baseRefName == $integration and .isDraft == false)] | length')
             if [ "$OPEN_FEATURE_TO_DEV" -gt 0 ]; then
                 echo "$LOG_PREFIX   ⏸️ Not creating ${INTEGRATION_BRANCH}→${MAIN_BRANCH} PR — $OPEN_FEATURE_TO_DEV open feature→${INTEGRATION_BRANCH} PR(s) still in flight"
