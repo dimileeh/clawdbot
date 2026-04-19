@@ -21,7 +21,7 @@ What counts as "acting":
 
 - Run the full loop (Steps 1–6 below) if the envelope demands it (review comments, CI failure), OR
 - Post a triage reply in chat explaining *why* you're deferring and *when* you'll finish (e.g. "CI is still running on the prior commit; will act once it settles, ETA ~5 min"), OR
-- Acknowledge merge / no-op reports with `NO_REPLY` only when the envelope truly requires no action (e.g. auto-merge success notifications where both PRs are already clean).
+- Relay merge / no-op reports to the human by default so they see the state change. `NO_REPLY` is only appropriate when the information is strictly redundant with something the human was already told in the same turn (e.g. auto-merge success for a PR the human just approved seconds ago in this chat). When in doubt, relay it.
 
 What does **not** count as acting:
 
