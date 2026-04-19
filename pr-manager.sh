@@ -691,10 +691,15 @@ INSTRUCTIONS
 4. Escalate via sessions_send to main label='main' for any product/design call you can't make unilaterally. The escalation message MUST start with '[ESCALATION] ${PR_KEY} ' and include the affected thread_ids so the main session knows which PR and which threads you couldn't handle.
 
 Completion summary template (final reply — success path):
-PR ${PR_KEY} head=<new_sha>: <N> threads resolved, <M> deferred. <one-line net code change>. CI: <status>.
+PR ${PR_KEY} (<head_branch>→<base_branch>) head=<new_sha>: <N> threads resolved, <M> deferred. <one-line net code change>. CI: <status>. mergeStateStatus: <literal value from gh pr view>.
+
+Rules for the summary line:
+- <head_branch> and <base_branch> come from the envelope file's \`head\` and \`base\` fields. Copy them verbatim — do NOT infer.
+- mergeStateStatus is the literal value returned by \`gh pr view <N> --json mergeStateStatus\` (e.g. CLEAN, BLOCKED, UNSTABLE, DIRTY, BEHIND, DRAFT). Do NOT interpret it (e.g. do not translate BLOCKED into 'awaiting human approval' — you do not know which protection rule caused it).
+- Keep the summary to ONE line. No multi-paragraph narration.
 
 Completion summary template (final reply — escalation path):
-[ESCALATION] ${PR_KEY} <reason>. threads=<comma-separated thread_ids>."
+[ESCALATION] ${PR_KEY} (<head_branch>→<base_branch>) <reason>. threads=<comma-separated thread_ids>."
     else
         HEADER="🔴 PR handler: $PR_KEY has a failed CI run (all review threads resolved)."
         FOOTER="You are an isolated handler subagent. Read the pr-review-hygiene skill first, then fix the failed CI via the pr-worktree pattern (~/pr-work/<repo>/pr-<N>/).
@@ -707,10 +712,15 @@ INSTRUCTIONS
 4. Escalate via sessions_send to main label='main' if the failure is infra-level (not a code bug) or requires a design call. The escalation message MUST start with '[ESCALATION] ${PR_KEY} ' so the main session can route it.
 
 Completion summary template (final reply — success path):
-PR ${PR_KEY} head=<new_sha>: CI fixed by <one-line change>. New run: <status>.
+PR ${PR_KEY} (<head_branch>→<base_branch>) head=<new_sha>: CI fixed by <one-line change>. New run: <status>. mergeStateStatus: <literal value from gh pr view>.
+
+Rules for the summary line:
+- <head_branch> and <base_branch> come from the envelope file's \`head\` and \`base\` fields. Copy them verbatim — do NOT infer.
+- mergeStateStatus is the literal value returned by \`gh pr view <N> --json mergeStateStatus\`. Do NOT interpret it.
+- Keep the summary to ONE line.
 
 Completion summary template (final reply — escalation path):
-[ESCALATION] ${PR_KEY} <infra-level or design reason>."
+[ESCALATION] ${PR_KEY} (<head_branch>→<base_branch>) <infra-level or design reason>."
     fi
 
     # Envelope is written to a TEMP FILE and the handler is told to
