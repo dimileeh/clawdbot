@@ -11,12 +11,15 @@
 #
 #   2. If a PR has unresolved review threads AND the per-PR "review wait"
 #      window (default 15 min since the last check of that SHA) has elapsed:
-#      → wake the orchestrator (Sparky) with a structured JSON payload so
-#        the LLM aggregates the comments, builds a plan, and executes.
+#      → spawn an isolated handler subagent (one per PR event) that
+#        aggregates the comments, builds a plan, executes inline or
+#        delegates to a swarm agent, and reports completion directly to
+#        the maintainer. Main orchestrator is NOT involved.
 #
 #   3. If a PR has 0 unresolved threads but CI failed:
-#      → wake the orchestrator with the failed-job log tail so it can
-#        plan the fix or delegate to a swarm agent.
+#      → spawn an isolated handler subagent with the failed-job log tail
+#        so it can plan the fix or delegate to a swarm agent. Same
+#        ownership model as (2).
 #
 #   4. If development is ahead of main with no open dev→main PR and no
 #      feature→development PRs in flight → create the dev→main PR.
@@ -24,11 +27,16 @@
 #      → fast-forward development to main.
 #
 # State is stored in $HOME/.clawdbot/pr-manager-state.json.
-# NO in_progress / handler-tracking bookkeeping: once Sparky has been
-# notified for a given PR at a given commit SHA, the script only re-notifies
+# NO in_progress / handler-tracking bookkeeping: once a handler has been
+# spawned for a given PR at a given commit SHA, the script only re-spawns
 # if the SHA advances OR if CLAWDBOT_RENOTIFY_MINUTES have elapsed without a
 # new commit. This means the signal "work is in flight" is the PR itself
 # (new commits or resolved threads), not a local marker that can leak.
+#
+# Handlers run in ISOLATED sessions (openclaw cron --session isolated) so
+# each PR event gets a fresh context. Main-session orchestrator (Sparky)
+# is invoked only when a handler explicitly escalates via sessions_send
+# with an ``[ESCALATION]`` prefix.
 
 set -euo pipefail
 
@@ -103,20 +111,80 @@ done
 
 # ─── Helpers ──────────────────────────────────────────────────────────────
 
-# Send a structured-event message to the orchestrator (the "main" OpenClaw
-# session). Uses `openclaw system event` which is the documented wake API
-# for foreground delivery. Returns the underlying exit code so callers can
-# gate state writes on successful delivery — otherwise a dropped wake would
-# look "notified" in state and suppress retries until RENOTIFY_MINUTES.
-_wake_sparky() {
+# Tunables for handler subagents. Model defaults to CLAWDBOT_REVIEW_MODEL
+# (the same env var the old architecture used) so the maintainer controls
+# which tier handles review + CI events without a code change.
+#
+# Timeout is generous (20 min) because a handler may need to: aggregate
+# comments, make several commits, run lint/test locally, push, then reply
+# + resolve each thread one API call at a time. Shorter timeouts kill
+# partially-completed loops and leave PRs worse than they started.
+HANDLER_MODEL="${CLAWDBOT_REVIEW_MODEL:-anthropic/claude-opus-4-7}"
+HANDLER_TIMEOUT_SECONDS="${CLAWDBOT_HANDLER_TIMEOUT_SECONDS:-1200}"
+HANDLER_CHANNEL="${CLAWDBOT_NOTIFY_CHANNEL:-telegram}"
+HANDLER_TARGET="${CLAWDBOT_NOTIFY_TARGET:-}"
+
+# Deliver a direct Telegram announce to the maintainer (used for merge /
+# no-op bookkeeping reports that are informational, not actionable). Runs
+# via ``openclaw message send`` which does not touch any LLM session.
+_announce_to_maintainer() {
     local text="$1"
-    if openclaw system event \
-        --mode now \
-        --text "$text" \
-        --timeout 5000 >/dev/null 2>&1; then
+    if [ -z "$HANDLER_TARGET" ]; then
+        echo "$LOG_PREFIX ⚠️ CLAWDBOT_NOTIFY_TARGET not set; cannot announce to maintainer" >&2
+        return 1
+    fi
+    if openclaw message send \
+        --channel "$HANDLER_CHANNEL" \
+        --to "$HANDLER_TARGET" \
+        --message "$text" >/dev/null 2>&1; then
         return 0
     fi
-    echo "$LOG_PREFIX ⚠️ Failed to wake orchestrator; state not marked notified, will retry next tick" >&2
+    echo "$LOG_PREFIX ⚠️ Failed to announce to maintainer; state not marked notified, will retry next tick" >&2
+    return 1
+}
+
+# Spawn an isolated handler subagent for a structured PR event (review_comments
+# or ci_failed). The agent gets the envelope as its message payload, runs
+# with the pr-review-hygiene skill, acts end-to-end on the PR, and reports
+# completion directly to the maintainer's configured channel.
+#
+# Main-session orchestrator (Sparky) is NOT involved — handlers own the
+# full loop. If a handler needs judgment, it escalates via ``sessions_send``
+# to the main session with an ``[ESCALATION]`` prefix.
+#
+# Returns 0 on successful spawn (cron job created), non-zero on failure so
+# callers can skip the state-mark and retry on the next tick.
+_spawn_handler_subagent() {
+    local event="$1"         # review_comments | ci_failed
+    local pr_key="$2"        # owner/repo#N
+    local envelope="$3"      # header + footer + ```json\n<JSON>\n``` text payload
+    local name="pr-handler-${event}-$(echo "$pr_key" | tr '/#' '--')-$(date -u +%s)"
+
+    if [ -z "$HANDLER_TARGET" ]; then
+        echo "$LOG_PREFIX ⚠️ CLAWDBOT_NOTIFY_TARGET not set; cannot spawn handler" >&2
+        return 1
+    fi
+
+    # Fire and forget — ``--at +5s --delete-after-run`` creates a one-shot
+    # cron job that self-cleans after completion. The job itself uses
+    # ``--session isolated`` + ``--message`` (kind=agentTurn) which is the
+    # isolated-subagent primitive (same contract as sessions_spawn). The
+    # agent's completion summary is announced to the configured channel.
+    if openclaw cron add \
+        --name "$name" \
+        --session isolated \
+        --at "+5s" \
+        --delete-after-run \
+        --model "$HANDLER_MODEL" \
+        --thinking high \
+        --timeout-seconds "$HANDLER_TIMEOUT_SECONDS" \
+        --announce \
+        --channel "$HANDLER_CHANNEL" \
+        --to "$HANDLER_TARGET" \
+        --message "$envelope" >/dev/null 2>&1; then
+        return 0
+    fi
+    echo "$LOG_PREFIX ⚠️ Failed to spawn handler subagent for $pr_key ($event); state not marked notified, will retry next tick" >&2
     return 1
 }
 
@@ -516,10 +584,12 @@ for REPO in $REPOS; do
 
 done
 
-# ─── Deliver queued notifications to Sparky ──────────────────────────────
-# One wake per event so Sparky can handle them in sequence. Each message is
-# a tagged envelope (JSON) with an instruction footer — the orchestrator
-# parses the envelope and produces a plan per PR.
+# ─── Deliver queued notifications as handler subagent spawns ─────────────
+# One isolated handler per event. Each handler owns its PR end-to-end:
+# aggregate comments, plan, fix inline or delegate to a swarm agent, commit,
+# reply + resolve threads, report completion to the maintainer. The main
+# orchestrator (Sparky) is NOT in the loop — handlers escalate only when
+# they need a product/design decision.
 for BLOB in "${NOTIFY_BLOBS[@]}"; do
     EVENT=$(echo "$BLOB" | jq -r '.event')
     PR_KEY=$(echo "$BLOB" | jq -r '.pr_key')
@@ -528,21 +598,22 @@ for BLOB in "${NOTIFY_BLOBS[@]}"; do
     STATE_TS=$(echo "$BLOB" | jq -r '._state_ts // empty')
 
     if [ "$EVENT" = "review_comments" ]; then
-        HEADER="📝 pr-manager: $PR_KEY has $(echo "$BLOB" | jq '.unresolved_threads | length') unresolved review thread(s) and the ${REVIEW_WAIT_MINUTES}m wait window has elapsed."
-        FOOTER="Aggregate the comments by theme + severity, write a short plan (which to fix, which to skip, in what order), post the plan in chat, then decide: fix inline yourself for small surgical changes, or delegate to a swarm agent for larger refactors. Commits land on the PR's head branch. Reply + resolve each thread when done."
+        HEADER="📝 PR handler: $PR_KEY has $(echo "$BLOB" | jq '.unresolved_threads | length') unresolved review thread(s) and the ${REVIEW_WAIT_MINUTES}m wait window has elapsed."
+        FOOTER="You are an isolated handler subagent. Read the \`pr-review-hygiene\` skill first, then own this PR end-to-end: aggregate the comments by theme + severity, write a short plan, fix inline for surgical changes or delegate to a swarm agent for larger refactors. Commits land on the PR's head branch via the pr-worktree pattern (\`~/pr-work/<repo>/pr-<N>/\`). Reply + resolve each thread when done. Report a concise completion summary at the end. Escalate to the main session via \`sessions_send\` with an \`[ESCALATION]\` prefix only if a product/design decision is required."
     else
-        HEADER="🔴 pr-manager: $PR_KEY has a failed CI run (all review threads resolved)."
-        FOOTER="Review the failed_job_logs field, diagnose the root cause, plan the fix, then decide: fix inline or delegate to a swarm agent. Commit to the PR's head branch so CI re-runs."
+        HEADER="🔴 PR handler: $PR_KEY has a failed CI run (all review threads resolved)."
+        FOOTER="You are an isolated handler subagent. Read the \`pr-review-hygiene\` skill first, then own this PR end-to-end: review the failed_job_logs field, diagnose the root cause, plan the fix. Commit to the PR's head branch via the pr-worktree pattern (\`~/pr-work/<repo>/pr-<N>/\`) so CI re-runs. Report a concise completion summary at the end. Escalate to the main session via \`sessions_send\` with an \`[ESCALATION]\` prefix only if the failure is infra-level (not a code bug) or requires a design call."
     fi
 
     # Strip the internal _state_* bookkeeping fields before rendering —
-    # the orchestrator only sees the public envelope shape documented in
-    # the header comment.
+    # the handler subagent only sees the public envelope shape documented
+    # in the header comment.
     ENVELOPE=$(echo "$BLOB" | jq 'del(._state_key, ._state_sha_key, ._state_ts)')
     TEXT=$(printf '%s\n\n%s\n\n```json\n%s\n```' "$HEADER" "$FOOTER" "$ENVELOPE")
 
-    if _wake_sparky "$TEXT"; then
-        # Only now mark the SHA as notified. A dropped wake stays "not
+    if _spawn_handler_subagent "$EVENT" "$PR_KEY" "$TEXT"; then
+        echo "$LOG_PREFIX 🤖 Spawned handler subagent for $PR_KEY ($EVENT)"
+        # Only now mark the SHA as notified. A failed spawn stays "not
         # notified" in state so the next tick retries immediately instead
         # of waiting for RENOTIFY_MINUTES.
         if [ -n "$STATE_KEY" ] && [ -n "$STATE_SHA_KEY" ] && [ -n "$STATE_TS" ]; then
@@ -558,7 +629,7 @@ if [ -n "$MERGE_REASONS" ]; then
     # Commit the notified_main_prs entries only AFTER a successful wake.
     # A dropped delivery leaves the SHA "not notified" so the next tick
     # retries, matching the review/CI notification contract above.
-    if _wake_sparky "$WAKE_TEXT"; then
+    if _announce_to_maintainer "$WAKE_TEXT"; then
         for pending in "${PENDING_MAIN_NOTIFICATIONS[@]:-}"; do
             [ -z "$pending" ] && continue
             pending_key="${pending%%|*}"

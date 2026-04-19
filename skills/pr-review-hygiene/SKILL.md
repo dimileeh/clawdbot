@@ -1,37 +1,40 @@
 ---
 name: pr-review-hygiene
-description: "Rules for the orchestrator (the LLM driving clawdbot) when it acts on pr-manager wake events. Covers Rule 0 (act on every wake — review_comments, ci_failed, merge/no-op reports, anything — in the same turn, relaying merge/no-op reports to the human by default), the review-reply-resolve loop, when to fix inline vs delegate to a swarm agent, when NOT to resolve a thread, and how to avoid lagging behind fresh review-bot comments. Use when: handling any `📝 pr-manager: ... unresolved review thread(s)`, `🔴 pr-manager: ... failed CI run`, or `🔧 PR Manager report` (merge / no-op) structured event, OR when replying to review bots on a PR you own."
+description: "Rules for isolated handler subagents spawned by clawdbot's pr-manager to own a single PR event end-to-end (review_comments or ci_failed). Covers Rule 0 (act on the envelope in this turn — no yielding back to the human until the loop is closed or escalated), the review-reply-resolve loop, when to fix inline vs delegate to a swarm agent, when NOT to resolve a thread, and when to escalate to the main session via `sessions_send [ESCALATION]`. Use when: you woke as an isolated handler subagent with a `📝 PR handler:` or `🔴 PR handler:` envelope in your agentTurn message."
 metadata:
   { "openclaw": { "emoji": "🔎" } }
 ---
 
 # PR Review Hygiene
 
-`pr-manager.sh` is a pure GitHub watchdog. It classifies each PR, auto-merges the safe ones, and wakes **you** (the orchestrator) with a structured JSON envelope when a PR needs judgement. This skill is the contract for what to do after that wake.
+You are an **isolated handler subagent** spawned by clawdbot's `pr-manager.sh` to own one PR event end-to-end. `pr-manager.sh` is a pure bash GitHub watchdog — it classifies each PR, auto-merges the safe ones, and spawns you with a structured JSON envelope when a PR needs judgement.
 
-You hold business context, memory, and the authority to decide *which* findings matter. Bash can't make those calls. Your job is to close the loop between "pr-manager saw a problem" and "the PR is clean again — reviewed, fixed, replied-to, resolved."
+You hold business context (via memory) and the authority to decide *which* findings matter. Bash can't make those calls. Your job is to close the loop between "pr-manager saw a problem" and "the PR is clean again — reviewed, fixed, replied-to, resolved." Then you report a short completion summary to the maintainer and exit.
 
-## Rule 0: Act on every wake in the same turn
+The main orchestrator session (Sparky) is **not involved** unless you explicitly escalate via `sessions_send` with an `[ESCALATION]` prefix. Don't ping the main session for status updates or confirmations — just do the work and report completion.
 
-**Every `pr-manager` wake event — `review_comments`, `ci_failed`, merge report, anything — gets a response in the same turn it arrives. No exceptions.**
+## Rule 0: Close the loop in this turn — don't yield half-done
 
-The pr-manager script is the human's trust contract. They built it to let them sleep, travel, or focus on other work while their PRs stay clean. If you ignore a wake, the human either (a) wakes up to a backlog of stale threads they'll now have to triage themselves, or (b) loses trust in the automation and starts babysitting it manually — which defeats the entire point.
+**You woke with one job: handle this envelope. Finish it or escalate it explicitly. Never exit the turn with the loop half-closed.**
 
-What counts as "acting":
+Common failure modes you must avoid:
 
-- Run the full loop (Steps 1–6 below) if the envelope demands it (review comments, CI failure), OR
-- Post a triage reply in chat explaining *why* you're deferring and *when* you'll finish (e.g. "CI is still running on the prior commit; will act once it settles, ETA ~5 min"), OR
-- Relay merge / no-op reports to the human by default so they see the state change. `NO_REPLY` is only appropriate when the information is strictly redundant with something the human was already told in the same turn (e.g. auto-merge success for a PR the human just approved seconds ago in this chat). When in doubt, relay it.
+- Replying `"Fixed in <SHA>"` on a thread but not clicking `resolveReviewThread` on it → the PR stays BLOCKED in the GitHub UI, the next pr-manager tick re-fires you on the same thread, and everyone (maintainer, review bots, other handlers) sees inconsistent state.
+- Pushing a commit that fixes some threads but leaves others untouched without replying to say so → reviewers re-post the same finding on the new SHA.
+- Calling a local `npm run build` pass "verified" and declaring the PR ready without running lint + tests + actually exercising the change → review bots catch it, pr-manager re-spawns you, 15 minutes of wall-clock wasted.
 
-What does **not** count as acting:
+What counts as "closing the loop":
 
-- Staying silent across multiple wakes on the same PR
-- "I'll get to it after this other thing" — without telling the human or the pr-manager script
-- Assuming pr-manager's debounce window will give you slack to procrastinate. The 15-min debounce exists to let review bots *converge*, not to let you queue work for later.
+- Run the full loop (Steps 1–6 below) for `📝 PR handler:` (review comments) and `🔴 PR handler:` (failed CI) envelopes, OR
+- Escalate via `sessions_send` with `[ESCALATION]` prefix if the envelope requires a product/design call you can't make (e.g. conflicting review bots demanding incompatible fixes, allow-list semantics, or design trade-offs the maintainer hasn't decided). Leave a note on the PR, don't mark threads resolved, exit.
 
-Failure mode this prevents: the agent handles an initial wake batch, then ignores several subsequent wakes for hours while the human sleeps — catching up only after review bots have piled on follow-up comments. The human sees the unresolved threads on GitHub before the agent does, and loses trust in the automation.
+What does **not** count as closing the loop:
 
-**The rule is immediate:** pr-manager wakes you, you act or explain in the same turn. Silence is never the right response to a pr-manager envelope.
+- Posting "I'll handle this later" — you are the handler; there is no later.
+- Replying without resolving (or resolving without replying)
+- Claiming a PR is ready without verifying `gh pr view N --json reviewDecision,statusCheckRollup` + `reviewThreads.isResolved` yourself
+
+**The rule is immediate:** you woke as an isolated handler, you close the loop on this PR in this turn. Silence, partial state, or "standing by" is never the right outcome of a handler's run.
 
 ## The loop
 
