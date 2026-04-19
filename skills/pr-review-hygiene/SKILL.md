@@ -11,6 +11,28 @@ metadata:
 
 You hold business context, memory, and the authority to decide *which* findings matter. Bash can't make those calls. Your job is to close the loop between "pr-manager saw a problem" and "the PR is clean again — reviewed, fixed, replied-to, resolved."
 
+## Rule 0: Act on every wake in the same turn
+
+**Every `pr-manager` wake event — `review_comments`, `ci_failed`, merge report, anything — gets a response in the same turn it arrives. No exceptions.**
+
+The pr-manager script is the human's trust contract. They built it to let them sleep, travel, or focus on other work while their PRs stay clean. If you ignore a wake, the human either (a) wakes up to a backlog of stale threads they'll now have to triage themselves, or (b) loses trust in the automation and starts babysitting it manually — which defeats the entire point.
+
+What counts as "acting":
+
+- Run the full loop (Steps 1–6 below) if the envelope demands it (review comments, CI failure), OR
+- Post a triage reply in chat explaining *why* you're deferring and *when* you'll finish (e.g. "CI is still running on the prior commit; will act once it settles, ETA ~5 min"), OR
+- Acknowledge merge / no-op reports with `NO_REPLY` only when the envelope truly requires no action (e.g. auto-merge success notifications where both PRs are already clean).
+
+What does **not** count as acting:
+
+- Staying silent across multiple wakes on the same PR
+- "I'll get to it after this other thing" — without telling the human or the pr-manager script
+- Assuming pr-manager's debounce window will give you slack to procrastinate. The 15-min debounce exists to let review bots *converge*, not to let you queue work for later.
+
+Failure mode this prevents: the agent handles an initial wake batch, then ignores several subsequent wakes for hours while the human sleeps — catching up only after review bots have piled on follow-up comments. The human sees the unresolved threads on GitHub before the agent does, and loses trust in the automation.
+
+**The rule is immediate:** pr-manager wakes you, you act or explain in the same turn. Silence is never the right response to a pr-manager envelope that contains unresolved work.
+
 ## The loop
 
 ```text
@@ -285,6 +307,7 @@ One summary message per wake cycle, not per commit. Include:
 | **Stale "done" report** | Declaring "all threads resolved" without re-checking after push. | Step 4 is non-negotiable. |
 | **Fix-triggers-followup loop** | Your fix introduces a second-order bug the same bot catches on the new SHA. | Expected. Handle in the same turn via Step 4 check. |
 | **Scope creep on nits** | Rewriting a module to address a trivial nit. | Nits → inline surgical fix or defer with reply. Refactors → dedicated PR. |
+| **Silent wake** | Agent receives a pr-manager envelope and neither acts nor replies. Human wakes to a backlog of stale threads. | Rule 0. Every wake gets a response in the same turn — full loop, triage-defer, or acknowledgement. Never silence. |
 
 ## Anti-patterns to reject
 
@@ -294,9 +317,11 @@ One summary message per wake cycle, not per commit. Include:
 - ❌ Declaring a PR "clean" without running Step 4
 - ❌ Treating pr-manager wakes as the only signal — they're a floor, not a ceiling
 - ❌ Merging dev→main PRs yourself (that's the human's call, always)
+- ❌ Ignoring a pr-manager wake because you're "busy with something else" — the envelope always gets at least an acknowledgement in the same turn
 
 ## Rules
 
+0. **Never stay silent on a pr-manager wake.** Act or acknowledge in the same turn. Silence is a bug.
 1. **Never resolve a thread without a reply.**
 2. **Never skip Step 4** (fresh-state check) after a push.
 3. **Never merge main-targeted PRs** — that's the human's decision.
