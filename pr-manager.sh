@@ -131,11 +131,15 @@ HANDLER_TIMEOUT_SECONDS=$(_parse_positive_int "${CLAWDBOT_HANDLER_TIMEOUT_SECOND
 HANDLER_THINKING="${CLAWDBOT_HANDLER_THINKING:-high}"
 # Thread-count ceiling for inline (handler-owned) fixes — above this
 # the bash script escalates directly to the maintainer instead of
-# paying for an LLM spawn (gemini _BbKB, clawdbot#26). Observed on
-# 2026-04-19: a 15-thread aggregate PR exhausted the handler's
-# context + hit retry/abort loops. 7 is a conservative ceiling; the
-# handler can still fix up to that many surgical finds.
-HANDLER_MAX_INLINE_THREADS=$(_parse_positive_int "${CLAWDBOT_HANDLER_MAX_INLINE_THREADS:-7}" 7 CLAWDBOT_HANDLER_MAX_INLINE_THREADS)
+# paying for an LLM spawn (gemini _BbKB, clawdbot#26). Raised from 7
+# to 20 on 2026-04-19 (clawdbot#??): the envelope-via-file refactor
+# (clawdbot#31) made handlers much more robust on big review batches
+# so aggregate dev→main PRs with ~10 bot findings can be handled
+# inline instead of bouncing to the maintainer. The ceiling is still
+# present because >20-thread PRs signal orchestration work (multiple
+# distinct design issues) that deserves human triage, not a single
+# handler run.
+HANDLER_MAX_INLINE_THREADS=$(_parse_positive_int "${CLAWDBOT_HANDLER_MAX_INLINE_THREADS:-20}" 20 CLAWDBOT_HANDLER_MAX_INLINE_THREADS)
 HANDLER_CHANNEL="${CLAWDBOT_NOTIFY_CHANNEL:-telegram}"
 HANDLER_TARGET="${CLAWDBOT_NOTIFY_TARGET:-}"
 
