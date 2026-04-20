@@ -28,6 +28,14 @@ REAL_GH_BIN="$(command -v gh || true)"
 CLAWDBOT_BIN_DIR="$HOME/.clawdbot/bin/${1:-unknown}"
 mkdir -p "$CLAWDBOT_BIN_DIR"
 _INTEGRATION="${CLAWDBOT_INTEGRATION_BRANCH:-development}"
+# MAIN_BRANCH is the trunk/long-lived branch new work branches off (via
+# ``git worktree add ... origin/$MAIN_BRANCH``). Distinct from _INTEGRATION
+# which is the staging branch PRs target. On Canopy, .env sets
+# CLAWDBOT_MAIN_BRANCH=develop. The ``main`` default is a last-resort
+# fallback — any .env setting CLAWDBOT_MAIN_BRANCH overrides. This line
+# must appear BEFORE the first $MAIN_BRANCH reference below or set -u
+# aborts the script with "MAIN_BRANCH: unbound variable".
+MAIN_BRANCH="${CLAWDBOT_MAIN_BRANCH:-main}"
 if [ -n "$REAL_GH_BIN" ]; then
   cat > "$CLAWDBOT_BIN_DIR/gh" <<'GHWRAPPER'
 #!/usr/bin/env bash
