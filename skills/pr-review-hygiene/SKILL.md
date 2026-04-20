@@ -63,26 +63,80 @@ Each step below has a non-negotiable rule.
 When a `review_comments` or `ci_failed` envelope arrives:
 
 1. **Read every comment body fully.** Review bots pack context inside collapsibles and `<details>` blocks; the one-line subject often undersells the issue.
-2. **Also scan review bodies for outside-diff findings.** The envelope only lists inline `reviewThreads` — those are line-anchored inside the PR's diff and have a resolve action. **CodeRabbit (and some other bots) also post "Outside diff range comments" inside the top-level review body** when a finding targets code the PR didn't touch but the bot thinks is related. These do NOT appear as threads and have no resolve action, but they can be real bugs. Fetch the review bodies and grep for the outside-diff block:
+2. **Also scan review bodies for outside-diff findings.** The envelope only lists inline `reviewThreads` — those are line-anchored inside the PR's diff and have a resolve action. **CodeRabbit (and some other bots) also post "Outside diff range comments" inside the top-level review body** when a finding targets code the PR didn't touch but the bot thinks is related. These do NOT appear as threads and have no resolve action, but they can be real bugs.
+
+   Fetch every review body (paginated, same discipline as Step 4's thread fetch) and filter to the ones containing the outside-diff block. Case-insensitive match in case bots change capitalization; `.body` null-check because approval-only reviews have no body text.
+
+   **GraphQL (recommended — returns node ids directly):**
 
    ```bash
-   gh api graphql -f query='
-     query($owner: String!, $repo: String!, $number: Int!) {
-       repository(owner: $owner, name: $repo) {
-         pullRequest(number: $number) {
-           reviews(first: 50) {
-             nodes { databaseId author { login } state body }
+   cursor="null"
+   reviews="[]"
+   while : ; do
+     page=$(gh api graphql -f query='
+       query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
+         repository(owner: $owner, name: $repo) {
+           pullRequest(number: $number) {
+             reviews(first: 50, after: $cursor) {
+               pageInfo { hasNextPage endCursor }
+               nodes { id author { login } state body }
+             }
            }
          }
-       }
-     }' \
-     -f owner="$OWNER" -f repo="$REPO" -F number="$PR" \
-     --jq '.data.repository.pullRequest.reviews.nodes[]
-           | select(.body | contains("Outside diff range"))
-           | {reviewer: .author.login, id: .databaseId, body}'
+       }' \
+       -f owner="$OWNER" -f repo="$REPO" -F number="$PR" \
+       $( [ "$cursor" = "null" ] || echo -f cursor="$cursor" ))
+     reviews=$(printf '%s\n%s' "$reviews" "$page" | jq -cs \
+       '.[0] + .[1].data.repository.pullRequest.reviews.nodes')
+     has_next=$(echo "$page" | jq -r '.data.repository.pullRequest.reviews.pageInfo.hasNextPage')
+     [ "$has_next" = "true" ] || break
+     cursor=$(echo "$page" | jq -r '.data.repository.pullRequest.reviews.pageInfo.endCursor')
+   done
+
+   echo "$reviews" | jq -c '.[]
+     | select(.body and (.body | ascii_downcase | contains("outside diff range")))
+     | {reviewer: .author.login, id: .id, body}'
    ```
 
-   Treat each outside-diff finding the same way as an inline thread: triage, decide inline-fix vs defer, address. Since there's no thread to resolve, the audit trail is: reply on the review itself (via `addPullRequestReviewComment` to the review, not `addPullRequestReviewThreadReply`) with the commit SHA that addressed it, OR reply explaining the deferral.
+   **REST alternative — when you already have auto-pagination available:**
+
+   ```bash
+   gh api --paginate "repos/$OWNER/$REPO/pulls/$PR/reviews" \
+     --jq '.[] | select(.body and (.body | ascii_downcase | contains("outside diff range")))
+            | {reviewer: .user.login, id: .node_id, body}'
+   ```
+
+   Treat each outside-diff finding the same way as an inline thread: triage, decide inline-fix vs defer, address. Since there's no thread to resolve, the audit trail is a **top-level comment on the PR** (not a review comment — `addPullRequestReviewComment` is inline-only and deprecated, and it requires a path+line inside the diff that an outside-diff finding by definition lacks).
+
+   **Post the audit-trail comment — GraphQL:**
+
+   ```bash
+   # Fetch the PR node id once (subjectId must be the PR, not a review).
+   PR_NODE_ID=$(gh api graphql -f query='
+     query($owner: String!, $repo: String!, $number: Int!) {
+       repository(owner: $owner, name: $repo) {
+         pullRequest(number: $number) { id }
+       }
+     }' -f owner="$OWNER" -f repo="$REPO" -F number="$PR" \
+     --jq '.data.repository.pullRequest.id')
+
+   gh api graphql -f query='
+     mutation($subjectId: ID!, $body: String!) {
+       addComment(input: {subjectId: $subjectId, body: $body}) {
+         commentEdge { node { id url } }
+       }
+     }' -f subjectId="$PR_NODE_ID" -f body="Addressed <REVIEWER>'s outside-diff finding on <path>:<line> in <SHA>. <one-line summary>."
+   ```
+
+   **REST alternative:**
+
+   ```bash
+   gh api "repos/$OWNER/$REPO/issues/$PR/comments" \
+     -X POST \
+     -f body="Addressed <REVIEWER>'s outside-diff finding on <path>:<line> in <SHA>. <one-line summary>."
+   ```
+
+   **Verification (mirror Step 4's fresh-state discipline).** After pushing a fix that addresses an outside-diff finding, re-fetch the review bodies and confirm the bot didn't post a NEW outside-diff finding on the same surface. Closing the loop on an outside-diff item means: (a) your audit-trail comment is visible on the PR, (b) re-running the pagination loop above returns no fresh matches you haven't already addressed. An outside-diff finding is only "done" when both conditions hold.
 
 3. **Aggregate by theme + severity.** Don't just walk the list top-to-bottom. Look for patterns (three comments about the same function, two that contradict each other).
 4. **Post a short plan in chat** before you start editing. Humans get to course-correct cheap here. Format:
