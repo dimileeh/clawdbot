@@ -402,19 +402,12 @@ for REPO in $REPOS; do
 
             case "$STATE" in
                 READY_DEV)
-                    HAS_OPEN_DEV_MAIN=$(echo "$PR_DATA" | jq --arg integration "$INTEGRATION_BRANCH" --arg main "$MAIN_BRANCH" '[.data.repository.pullRequests.nodes[] | select(.baseRefName == $main and .headRefName == $integration)] | length')
-                    if [ "$HAS_OPEN_DEV_MAIN" -gt 0 ]; then
-                        # Log-only: do NOT add to MERGE_REASONS. Otherwise
-                        # every tick (every 5 minutes) re-wakes the
-                        # orchestrator with the same "still holding"
-                        # message until the blocker PR closes, which is
-                        # noise for a known, expected interlock. The
-                        # operator can grep the log file if they want a
-                        # history; the state is also visible in GitHub
-                        # (the feature PR is simply still open).
-                        echo "$LOG_PREFIX     ⏸️ Holding $PR_KEY — open $INTEGRATION_BRANCH→$MAIN_BRANCH PR exists"
-                        continue
-                    fi
+                    # Order matters: run the review gate BEFORE the
+                    # HAS_OPEN_DEV_MAIN hold so webapp findings surface
+                    # even when the integration→main PR is waiting on
+                    # the maintainer's manual merge. Only
+                    # ALREADY_MERGED skips review (no point reviewing a
+                    # merged PR).
                     ALREADY_MERGED=$(jq -r ".merged_prs[\"$PR_KEY\"] // \"\"" "$STATE_FILE")
                     if [ -n "$ALREADY_MERGED" ]; then
                         echo "$LOG_PREFIX     Already merged (tracked)"
@@ -507,7 +500,22 @@ $REV_ENVELOPE
                     fi
                     # Falling through: either already reviewed this SHA
                     # (reviewer approved) or non-critical paths or spawn
-                    # failed. Auto-merge proceeds.
+                    # failed. Auto-merge is gated on the integration→main
+                    # interlock below.
+
+                    HAS_OPEN_DEV_MAIN=$(echo "$PR_DATA" | jq --arg integration "$INTEGRATION_BRANCH" --arg main "$MAIN_BRANCH" '[.data.repository.pullRequests.nodes[] | select(.baseRefName == $main and .headRefName == $integration)] | length')
+                    if [ "$HAS_OPEN_DEV_MAIN" -gt 0 ]; then
+                        # Log-only: do NOT add to MERGE_REASONS. Otherwise
+                        # every tick (every 5 minutes) re-wakes the
+                        # orchestrator with the same "still holding"
+                        # message until the blocker PR closes, which is
+                        # noise for a known, expected interlock. The
+                        # operator can grep the log file if they want a
+                        # history; the state is also visible in GitHub
+                        # (the feature PR is simply still open).
+                        echo "$LOG_PREFIX     ⏸️ Holding $PR_KEY — open ${INTEGRATION_BRANCH}->${MAIN_BRANCH} PR exists"
+                        continue
+                    fi
 
                     echo "$LOG_PREFIX     ✅ Auto-merging PR #$PR_NUM to development..."
                     if gh pr merge "$PR_NUM" --repo "$REPO" --squash --delete-branch 2>&1; then
