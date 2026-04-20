@@ -63,21 +63,43 @@ Each step below has a non-negotiable rule.
 When a `review_comments` or `ci_failed` envelope arrives:
 
 1. **Read every comment body fully.** Review bots pack context inside collapsibles and `<details>` blocks; the one-line subject often undersells the issue.
-2. **Aggregate by theme + severity.** Don't just walk the list top-to-bottom. Look for patterns (three comments about the same function, two that contradict each other).
-3. **Post a short plan in chat** before you start editing. Humans get to course-correct cheap here. Format:
+2. **Also scan review bodies for outside-diff findings.** The envelope only lists inline `reviewThreads` — those are line-anchored inside the PR's diff and have a resolve action. **CodeRabbit (and some other bots) also post "Outside diff range comments" inside the top-level review body** when a finding targets code the PR didn't touch but the bot thinks is related. These do NOT appear as threads and have no resolve action, but they can be real bugs. Fetch the review bodies and grep for the outside-diff block:
+
+   ```bash
+   gh api graphql -f query='
+     query($owner: String!, $repo: String!, $number: Int!) {
+       repository(owner: $owner, name: $repo) {
+         pullRequest(number: $number) {
+           reviews(first: 50) {
+             nodes { databaseId author { login } state body }
+           }
+         }
+       }
+     }' \
+     -f owner="$OWNER" -f repo="$REPO" -F number="$PR" \
+     --jq '.data.repository.pullRequest.reviews.nodes[]
+           | select(.body | contains("Outside diff range"))
+           | {reviewer: .author.login, id: .databaseId, body}'
+   ```
+
+   Treat each outside-diff finding the same way as an inline thread: triage, decide inline-fix vs defer, address. Since there's no thread to resolve, the audit trail is: reply on the review itself (via `addPullRequestReviewComment` to the review, not `addPullRequestReviewThreadReply`) with the commit SHA that addressed it, OR reply explaining the deferral.
+
+3. **Aggregate by theme + severity.** Don't just walk the list top-to-bottom. Look for patterns (three comments about the same function, two that contradict each other).
+4. **Post a short plan in chat** before you start editing. Humans get to course-correct cheap here. Format:
 
    ```text
-   PR #N — M threads.
+   PR #N — M threads + K outside-diff findings.
 
    Fixing (k):
    - <severity> <one-line summary> — fix inline
    - <severity> <one-line summary> — delegate to swarm (reason)
+   - <severity> <outside-diff: file:line> — fix inline (or: out of scope, deferred)
 
    Skipping (j):
    - <severity> <one-line summary> — <reason: duplicate / already fixed / out of scope / policy call>
    ```
 
-4. **If the human is actively chatting**, wait for their nod on the plan before executing. If they've said "just handle these going forward" / "you have my approval for routine review fixes," proceed without asking.
+5. **If the human is actively chatting**, wait for their nod on the plan before executing. If they've said "just handle these going forward" / "you have my approval for routine review fixes," proceed without asking.
 
 ## Step 2: Fix inline vs. delegate to swarm
 
@@ -321,6 +343,7 @@ One summary message per wake cycle, not per commit. Include:
 - ❌ Treating pr-manager wakes as the only signal — they're a floor, not a ceiling
 - ❌ Merging dev→main PRs yourself (that's the human's call, always)
 - ❌ Ignoring a pr-manager wake because you're "busy with something else" — the envelope always gets at least an acknowledgement in the same turn
+- ❌ Only looking at inline `reviewThreads` and ignoring outside-diff findings in review bodies — real bugs hide there
 
 ## Rules
 
