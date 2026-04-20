@@ -321,6 +321,25 @@ jq --arg id "$TASK_ID" \
    '. += [{id: $id, tmuxSession: $tmux, runnerPid: $pid, agent: $agent, model: $model, description: $desc, repo: $repo, repoPath: $repoPath, worktree: $worktree, branch: $branch, startedAt: $now, status: "running", respawnCount: 0, maxRespawns: 3, notifyOnComplete: true}]' \
    "$REGISTRY" > "$REGISTRY.tmp" && mv "$REGISTRY.tmp" "$REGISTRY"
 
+# ── Notify maintainer directly (infrastructure push) ──
+# Bypasses Sparky entirely. Previous attempts to drive updates from Sparky's
+# response text failed in different ways (watchdog-kill mid-poll, wrong
+# sessions_send label, empty reply interpretation). Pushing from here is
+# deterministic: every spawn that reaches this line fires exactly one
+# Telegram message to the maintainer, independent of Sparky's discretion.
+_NOTIFY_CHANNEL="${CLAWDBOT_NOTIFY_CHANNEL:-telegram}"
+_NOTIFY_TARGET="${CLAWDBOT_NOTIFY_TARGET:-}"
+if [ -n "$_NOTIFY_TARGET" ]; then
+  _SPAWN_MSG=$(printf '🛫 Spawned agent \`%s\` → branch \`%s\` (%s · %s).\nRunner PID %s; pr-manager will ping when PR is ready.' \
+    "$TASK_ID" "$BRANCH" "$AGENT" "$MODEL" "$RUNNER_PID")
+  # Never block spawn success on this; worst case the message is just missed.
+  openclaw message send \
+    --channel "$_NOTIFY_CHANNEL" \
+    --target "$_NOTIFY_TARGET" \
+    --message "$_SPAWN_MSG" >/dev/null 2>&1 || \
+    echo "⚠️ Failed to announce spawn to $_NOTIFY_CHANNEL target $_NOTIFY_TARGET; continuing" >&2
+fi
+
 echo "✅ Agent spawned:"
 echo "   Task: $TASK_ID"
 echo "   Branch: $BRANCH"

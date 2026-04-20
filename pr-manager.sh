@@ -103,7 +103,7 @@ _iso_minutes_ago() {
 [ -f "$STATE_FILE" ] || echo '{}' > "$STATE_FILE"
 # Ensure top-level keys. notified_reviews / notified_ci are keyed by
 # "<repo>#<num>@<sha>" so a new commit cleanly resets them.
-for KEY in notified_main_prs merged_prs created_dev_main_prs first_seen_unresolved notified_reviews notified_ci; do
+for KEY in notified_main_prs merged_prs created_dev_main_prs first_seen_unresolved notified_reviews notified_ci spawned_reviews review_rounds; do
     if ! jq -e ".$KEY" "$STATE_FILE" >/dev/null 2>&1; then
         jq ". + {\"$KEY\":{}}" "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
     fi
@@ -420,6 +420,95 @@ for REPO in $REPOS; do
                         echo "$LOG_PREFIX     Already merged (tracked)"
                         continue
                     fi
+
+                    # ─── Swarm-review gate ──────────────────────────────
+                    # Before auto-merge fires on a webapp/prisma PR, spawn
+                    # the swarm-review reviewer subagent. If it posts any
+                    # BLOCK-severity comments those become unresolved review
+                    # threads; the next pr-manager tick reclassifies the PR
+                    # as HAS_COMMENTS and the existing pr-review-hygiene
+                    # handler picks up the loop. If the reviewer approves
+                    # (no BLOCKs), the PR stays READY_DEV on the next tick
+                    # and auto-merge proceeds.
+                    #
+                    # Round cap: CLAWDBOT_REVIEW_MAX_ROUNDS (default 3).
+                    # When hit, escalate to the maintainer and DO NOT
+                    # auto-merge — the cap protects against infinite
+                    # reviewer↔handler disagreement loops.
+                    REVIEW_MAX_ROUNDS="${CLAWDBOT_REVIEW_MAX_ROUNDS:-3}"
+                    SHA_KEY="${PR_KEY}@${COMMIT_SHA}"
+                    ALREADY_REVIEWED_SHA=$(jq -r ".spawned_reviews[\"$SHA_KEY\"] // \"\"" "$STATE_FILE")
+                    ROUNDS_USED=$(jq -r ".review_rounds[\"$PR_KEY\"] // 0" "$STATE_FILE")
+
+                    if [ -z "$ALREADY_REVIEWED_SHA" ]; then
+                        # Haven't reviewed this SHA yet. Check whether diff
+                        # touches the load-bearing paths (webapp/ or prisma/).
+                        # Lightweight files fetch — cheap compared to the
+                        # reviewer spawn that'd follow.
+                        CRITICAL_HITS=$(gh pr view "$PR_NUM" --repo "$REPO" --json files \
+                            --jq '[.files[].path | select(startswith("webapp/") or startswith("prisma/"))] | length' \
+                            2>/dev/null || echo 0)
+                        if [ "${CRITICAL_HITS:-0}" -gt 0 ]; then
+                            if [ "$ROUNDS_USED" -ge "$REVIEW_MAX_ROUNDS" ]; then
+                                # Cap hit — escalate rather than spawn another round.
+                                CAP_MSG=$(printf '⚠️ PR %s: reviewer/handler loop hit %s-round cap without converging. Fresh SHA %s ready for your eyeball. %s' \
+                                    "$PR_KEY" "$REVIEW_MAX_ROUNDS" "${COMMIT_SHA:0:7}" "$PR_URL")
+                                _announce_to_maintainer "$CAP_MSG" || true
+                                echo "$LOG_PREFIX     🚨 Review round cap ($REVIEW_MAX_ROUNDS) hit — escalated, not auto-merging"
+                                # Record the SHA as 'seen' to avoid re-escalating each tick.
+                                jq --arg sha_key "$SHA_KEY" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                                    '.spawned_reviews[$sha_key] = $ts' \
+                                    "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+                                continue
+                            fi
+
+                            NEW_ROUND=$((ROUNDS_USED + 1))
+                            echo "$LOG_PREFIX     🔍 Spawning swarm-review (round $NEW_ROUND/$REVIEW_MAX_ROUNDS) for $PR_KEY ($CRITICAL_HITS critical-path file(s))"
+
+                            REV_ENVELOPE=$(jq -n \
+                                --arg pk "$PR_KEY" --arg repo "$REPO" \
+                                --argjson num "$PR_NUM" --arg url "$PR_URL" \
+                                --arg sha "$COMMIT_SHA" --arg head "$PR_HEAD" \
+                                --arg base "$PR_BASE" --argjson round "$NEW_ROUND" \
+                                --argjson cap "$REVIEW_MAX_ROUNDS" \
+                                '{event:"swarm_review", pr_key:$pk, repo:$repo, number:$num, url:$url, head_sha:$sha, head:$head, base:$base, round:$round, max_rounds:$cap}')
+
+                            REV_TEXT="🔍 PR reviewer: $PR_KEY (round $NEW_ROUND/$REVIEW_MAX_ROUNDS) — fresh SHA ${COMMIT_SHA:0:7} on $PR_HEAD → $PR_BASE. Post Canopy-specific review, exit.
+
+INSTRUCTIONS
+
+1. Read the swarm-review skill BEFORE reviewing the PR.
+2. Read the envelope JSON below.
+3. Fetch diff via \`gh pr diff $PR_NUM --repo $REPO\` and file list via \`gh pr view $PR_NUM --repo $REPO --json files\`.
+4. Post inline review comments — one per finding, severity-tagged (BLOCK/WARN/NIT) — via \`gh api repos/$REPO/pulls/$PR_NUM/comments\` (one call per comment) then finalize with \`gh pr review $PR_NUM --repo $REPO --request-changes|--approve|--comment\`.
+5. Use \`\`\`suggestion\`\`\` blocks in BLOCK comments when the fix is mechanical and ≤10 lines.
+6. Emit ZERO intermediate assistant text. Produce exactly ONE final summary message at the end.
+7. Exit your turn after posting. DO NOT wait for the handler — the handler is a separate subagent pr-manager will spawn on the next tick if your BLOCKs create unresolved threads.
+
+Round awareness: this is round $NEW_ROUND. If >1, check \`gh pr view --json reviewThreads\` for threads from prior rounds and DO NOT re-post findings that were addressed.
+
+Envelope:
+\`\`\`json
+$REV_ENVELOPE
+\`\`\`"
+
+                            if _spawn_handler_subagent "swarm_review" "$PR_KEY" "$REV_TEXT"; then
+                                jq --arg sha_key "$SHA_KEY" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                                   --arg pr_key "$PR_KEY" --argjson round "$NEW_ROUND" \
+                                    '.spawned_reviews[$sha_key] = $ts | .review_rounds[$pr_key] = $round' \
+                                    "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+                                echo "$LOG_PREFIX     ⏸️ Deferring auto-merge this tick; reviewer will post findings"
+                                continue
+                            fi
+                            echo "$LOG_PREFIX     ⚠️ Reviewer spawn failed; proceeding with ungated auto-merge this tick" >&2
+                        else
+                            echo "$LOG_PREFIX     ✓ No webapp/prisma paths touched; skipping swarm review, auto-merging directly"
+                        fi
+                    fi
+                    # Falling through: either already reviewed this SHA
+                    # (reviewer approved) or non-critical paths or spawn
+                    # failed. Auto-merge proceeds.
+
                     echo "$LOG_PREFIX     ✅ Auto-merging PR #$PR_NUM to development..."
                     if gh pr merge "$PR_NUM" --repo "$REPO" --squash --delete-branch 2>&1; then
                         MERGE_REASONS="${MERGE_REASONS}✅ Auto-merged $PR_KEY to development: $PR_TITLE\n   $PR_URL\n"
