@@ -241,9 +241,20 @@ _spawn_handler_subagent() {
     # (return 1, retry next tick) from "didn't spawn because in-flight"
     # (return 2, skip state-mark AND skip retry until the running handler
     # finishes on its own).
-    local pr_prefix
+    # Fail-closed on control-plane errors (coderabbit flagged on PR #35): if
+    # ``openclaw cron list`` fails or returns invalid JSON, the pipeline-in-if
+    # evaluates false and we would fall through to spawn a duplicate handler,
+    # which is the exact scenario this guard exists to prevent. Capture the
+    # listing separately so we can distinguish "listing failed" (skip this
+    # tick, retry next) from "listing succeeded with zero matches" (safe to
+    # spawn).
+    local pr_prefix cron_jobs_json
     pr_prefix=$(echo "$pr_key" | tr '/#' '--')
-    if openclaw cron list --json 2>/dev/null \
+    if ! cron_jobs_json=$(openclaw cron list --json 2>/dev/null); then
+        echo "$LOG_PREFIX     ⚠️  Could not list existing handler crons for $pr_key ($event); skipping spawn this tick" >&2
+        return 1
+    fi
+    if printf '%s\n' "$cron_jobs_json" \
         | jq -e --arg prefix "pr-handler-${event}-${pr_prefix}" '
             [.jobs[]?
              | select(.name | sub("-[0-9]+$"; "") == $prefix)
@@ -804,7 +815,7 @@ Before touching any file or thread, fetch CURRENT state with gh and cross-check 
      - If state != OPEN: reply '✅ <short-repo>#<n>: PR already merged/closed, no action taken' and exit. Do NOT attempt commits or thread replies.
      - If headRefOid != the envelope's head_sha: new commits landed since the envelope was written. Reply '⚠️ <short-repo>#<n> needs you — new commits landed since my task was queued' and exit. Do NOT attempt to graft your own fixes onto a branch tip you haven't read.
 
-  b) Run the same GraphQL query the envelope used to count unresolved threads. The graphql body should match the one the envelope-writer in pr-manager.sh uses: fetch reviewThreads (first:50) with id/isResolved/isOutdated, then filter isResolved == false AND isOutdated == false, and count.
+  b) Run the same GraphQL query the envelope used to count unresolved threads. The graphql body should match the one the envelope-writer in pr-manager.sh uses: fetch reviewThreads (first:100) with id/isResolved/isOutdated, then filter isResolved == false AND isOutdated == false, and count.
      - If 0 unresolved: reply '✅ <short-repo>#<n>: all threads already resolved, no action taken' and exit.
      - If the set differs significantly from the envelope (e.g. envelope listed 5 threads, only 1 unresolved now): work only the currently-unresolved subset. Do not reply to or re-open threads that are already resolved.
 
@@ -899,8 +910,14 @@ Rules: same as the review_comments branch. No SHA, no mergeStateStatus, no (head
 
     TEXT=$(printf '%s\n\n%s\n\nRead the envelope JSON at: %s\n' "$HEADER" "$FOOTER" "$ENVELOPE_FILE")
 
-    _spawn_handler_subagent "$EVENT" "$PR_KEY" "$TEXT"
-    SPAWN_RC=$?
+    # ``set -euo pipefail`` (line 41) is active here; a non-zero return from
+    # _spawn_handler_subagent would otherwise abort the whole script before
+    # ``SPAWN_RC=$?`` can capture it — which would skip the dedup (rc=2) and
+    # generic-failure (rc=1) cleanup paths and crash the tick mid-loop, so
+    # the rest of the notification queue never fires. coderabbit caught
+    # on PR #35. Capture via ``|| SPAWN_RC=$?`` so failures do not trip errexit.
+    SPAWN_RC=0
+    _spawn_handler_subagent "$EVENT" "$PR_KEY" "$TEXT" || SPAWN_RC=$?
     case "$SPAWN_RC" in
         0)
             echo "$LOG_PREFIX 🤖 Spawned handler subagent for $PR_KEY ($EVENT)"
