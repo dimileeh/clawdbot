@@ -123,7 +123,12 @@ HANDLER_MODEL="${CLAWDBOT_REVIEW_MODEL:-anthropic/claude-opus-4-7}"
 # Validate the timeout through the same positive-int helper the other
 # numeric tunables use so a typo in .env fails visibly here instead of
 # at every handler spawn (coderabbit _EhD, clawdbot#24).
-HANDLER_TIMEOUT_SECONDS=$(_parse_positive_int "${CLAWDBOT_HANDLER_TIMEOUT_SECONDS:-1200}" 1200 CLAWDBOT_HANDLER_TIMEOUT_SECONDS)
+# Default raised from 1200 → 5400 (90 min). A handler that pushes commits +
+# waits for CI re-runs + replies to multiple threads legitimately needs > 20
+# min in some cases. Pairing with the dedup guard below (``_handler_already_running``)
+# means a generous per-job budget no longer causes handler overlap for the
+# same PR, only more headroom for the one handler that IS running.
+HANDLER_TIMEOUT_SECONDS=$(_parse_positive_int "${CLAWDBOT_HANDLER_TIMEOUT_SECONDS:-5400}" 5400 CLAWDBOT_HANDLER_TIMEOUT_SECONDS)
 # Thinking level is configurable because not every model supports
 # ``high`` (gemini _Eb6, clawdbot#24). ``openclaw cron add --thinking``
 # accepts off|minimal|low|medium|high|xhigh; anything else fails at
@@ -206,6 +211,78 @@ _spawn_handler_subagent() {
 
     if [ -z "$HANDLER_TARGET" ]; then
         echo "$LOG_PREFIX ⚠️ CLAWDBOT_NOTIFY_TARGET not set; cannot spawn handler" >&2
+        return 1
+    fi
+
+    # Dedup guard: suppress spawn if a handler for the same PR+event is
+    # already scheduled or running. Without this, every tick (every 5 min)
+    # re-spawns a new isolated Opus session for the same PR while the
+    # previous one is still mid-flight — observed 2026-04-21: 14 overlapping
+    # handlers for one PR in a single night, each reading a stale envelope
+    # and thrashing on already-resolved threads until their timeout expired.
+    #
+    # Match strategy: strip the trailing ``-<unix_timestamp>`` suffix from
+    # each cron job's name and compare the remainder EXACTLY to the
+    # PR+event-specific prefix. This is strictly stricter than ``startswith``
+    # so ``pr-handler-review_comments-owner-repo-31-*`` cannot collide with
+    # ``pr-handler-review_comments-owner-repo-316-*`` (current code's
+    # trailing ``-`` already disambiguates these cases but defence-in-depth
+    # keeps us robust to future naming-format changes). gemini-code-assist
+    # flagged on PR #35.
+    #
+    # We do NOT filter on ``state.runningAtMs != null``: a cron job scheduled
+    # ``--at 10s`` is in the list but not yet firing for its first 10s, and
+    # under scheduler backpressure the window grows. Either state (queued or
+    # running) is in-flight for our purposes. ``--delete-after-run`` ensures
+    # finished jobs disappear from the listing automatically, so any surviving
+    # matching entry is genuinely unresolved work.
+    #
+    # Returns 2 on dedup skip so callers can distinguish "failed to spawn"
+    # (return 1, retry next tick) from "didn't spawn because in-flight"
+    # (return 2, skip state-mark AND skip retry until the running handler
+    # finishes on its own).
+    # Fail-closed on control-plane errors (coderabbit flagged on PR #35): if
+    # ``openclaw cron list`` fails or returns invalid JSON, the pipeline-in-if
+    # evaluates false and we would fall through to spawn a duplicate handler,
+    # which is the exact scenario this guard exists to prevent. Capture the
+    # listing separately so we can distinguish "listing failed" (skip this
+    # tick, retry next) from "listing succeeded with zero matches" (safe to
+    # spawn).
+    local pr_prefix cron_jobs_json
+    pr_prefix=$(echo "$pr_key" | tr '/#' '--')
+    if ! cron_jobs_json=$(openclaw cron list --json 2>/dev/null); then
+        echo "$LOG_PREFIX     ⚠️  Could not list existing handler crons for $pr_key ($event); skipping spawn this tick" >&2
+        return 1
+    fi
+    # jq exit-code discipline (gemini flagged on PR #36):
+    #   exit 0 → filter matched = dedup (rc=2)
+    #   exit 1 → filter returned false/null = no dupe, safe to proceed
+    #   exit >= 2 → jq failed to parse its input OR the filter raised an
+    #                error (e.g. schema-validation ``error(...)`` below)
+    #                = control-plane failure, skip this tick (rc=1) to
+    #                  avoid fail-open duplicate-spawn. Using here-string
+    #                  keeps the check single-process (no pipe) so $?
+    #                  reflects jq directly without PIPESTATUS gymnastics.
+    #
+    # Schema hardening (coderabbit flagged on PR #37): a bare ``.jobs[]?``
+    # SUPPRESSES missing-key errors, so a valid-JSON-wrong-shape payload
+    # (e.g. ``{"error":"rate_limited"}`` from a degraded control plane)
+    # would yield an empty array, length-check false, exit 1 — which we
+    # would then treat as "safe to spawn". That's the exact fail-open
+    # this guard exists to prevent. Validate ``.jobs`` is an array first
+    # and explicitly ``error()`` otherwise so jq exits >=2 and lands on
+    # the fail-closed branch below.
+    if jq -e --arg prefix "pr-handler-${event}-${pr_prefix}" '
+            if (.jobs | type) != "array" then
+              error("invalid cron list payload: .jobs missing or not an array")
+            else
+              any(.jobs[]?;
+                  ((.name? // "") | sub("-[0-9]+$"; "")) == $prefix)
+            end' <<< "$cron_jobs_json" >/dev/null 2>&1; then
+        echo "$LOG_PREFIX     ⏭️  Handler already scheduled or running for $pr_key ($event); skipping spawn" >&2
+        return 2
+    elif [ $? -ge 2 ]; then
+        echo "$LOG_PREFIX     ⚠️  Handler cron list JSON was malformed or not shaped as expected for $pr_key ($event); skipping spawn this tick" >&2
         return 1
     fi
 
@@ -751,6 +828,22 @@ INSTRUCTIONS
 3. Emit ZERO intermediate assistant text. Every assistant message gets announced to the maintainer's Telegram, so intermediate 'Now let me...' narrations spam the chat. Do all reasoning silently via tool-use. Produce exactly ONE final text reply at the end.
 4. Escalate via sessions_send to main label='main' for any product/design call you can't make unilaterally. The escalation message MUST start with '[ESCALATION] ${PR_KEY} ' and include the affected thread_ids so the main session knows which PR and which threads you couldn't handle.
 
+Step 0 (staleness check, MANDATORY before any other work):
+
+The envelope was written by pr-manager at tick time, up to several minutes before this handler actually fires. The PR state may have moved on since then — the maintainer or another handler may have merged, closed, pushed new commits, or resolved threads. Acting on a stale envelope wastes the full per-handler token budget on no-ops and thrashes GitHub API calls against resolved threads.
+
+Before touching any file or thread, fetch CURRENT state with gh and cross-check against the envelope:
+
+  a) Run: gh pr view <pr_number> --repo <owner/repo> --json state,mergedAt,closedAt,headRefOid
+     - If state != OPEN: reply '✅ <short-repo>#<n>: PR already merged/closed, no action taken' and exit. Do NOT attempt commits or thread replies.
+     - If headRefOid != the envelope's head_sha: new commits landed since the envelope was written. Reply '⚠️ <short-repo>#<n> needs you — new commits landed since my task was queued' and exit. Do NOT attempt to graft your own fixes onto a branch tip you haven't read.
+
+  b) Run the same GraphQL query the envelope used to count unresolved threads. The graphql body should match the one the envelope-writer in pr-manager.sh uses: fetch reviewThreads (first:100) with id/isResolved/isOutdated, then filter isResolved == false AND isOutdated == false, and count.
+     - If 0 unresolved: reply '✅ <short-repo>#<n>: all threads already resolved, no action taken' and exit.
+     - If the set differs significantly from the envelope (e.g. envelope listed 5 threads, only 1 unresolved now): work only the currently-unresolved subset. Do not reply to or re-open threads that are already resolved.
+
+This check costs you ~2 tool calls and under 5 seconds. Skipping it costs up to 90 minutes and a full Opus budget on work that was already done. Run it.
+
 Final reply format — this lands in the maintainer's Telegram. Humans read it on their phone. Keep it short, human, tappable.
 
 Success path — two lines:
@@ -789,6 +882,21 @@ INSTRUCTIONS
 3. Emit ZERO intermediate assistant text. Every assistant message gets announced to the maintainer's Telegram, so narrations spam the chat. Do all reasoning silently via tool-use. Produce exactly ONE final text reply at the end.
 4. Escalate via sessions_send to main label='main' if the failure is infra-level (not a code bug) or requires a design call. The escalation message MUST start with '[ESCALATION] ${PR_KEY} ' so the main session can route it.
 
+Step 0 (staleness check, MANDATORY before any other work):
+
+The envelope and the failing-job log tail were captured at pr-manager tick time, up to several minutes before this handler fires. The PR and its CI may have moved on since then — the run may have been retried and gone green, the PR may have been merged or closed, or new commits may have landed.
+
+Before touching any file, fetch CURRENT state:
+
+  a) Run: gh pr view <pr_number> --repo <owner/repo> --json state,mergedAt,closedAt,headRefOid
+     - If state != OPEN: reply '✅ <short-repo>#<n>: PR already merged/closed, no action taken' and exit.
+     - If headRefOid != the envelope's head_sha: reply '⚠️ <short-repo>#<n> needs you — new commits landed since my task was queued' and exit.
+
+  b) Run: gh pr checks <pr_number> --repo <owner/repo>
+     - If CI is now green or the failing job is re-running: reply '✅ <short-repo>#<n>: CI already re-ran green, no action taken' and exit (or wait briefly if mid-retry, but do not duplicate-fix).
+
+This check is cheap. Skipping it burns the full handler budget on already-fixed failures.
+
 Final reply format — this lands in the maintainer's Telegram. Keep it short, human, tappable.
 
 Success path — two lines:
@@ -825,16 +933,39 @@ Rules: same as the review_comments branch. No SHA, no mergeStateStatus, no (head
 
     TEXT=$(printf '%s\n\n%s\n\nRead the envelope JSON at: %s\n' "$HEADER" "$FOOTER" "$ENVELOPE_FILE")
 
-    if _spawn_handler_subagent "$EVENT" "$PR_KEY" "$TEXT"; then
-        echo "$LOG_PREFIX 🤖 Spawned handler subagent for $PR_KEY ($EVENT)"
-        # Only now mark the SHA as notified. A failed spawn stays "not
-        # notified" in state so the next tick retries immediately instead
-        # of waiting for RENOTIFY_MINUTES.
-        if [ -n "$STATE_KEY" ] && [ -n "$STATE_SHA_KEY" ] && [ -n "$STATE_TS" ]; then
-            jq --arg state_key "$STATE_KEY" --arg sha_key "$STATE_SHA_KEY" --arg ts "$STATE_TS" \
-                '.[$state_key][$sha_key] = $ts' "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
-        fi
-    fi
+    # ``set -euo pipefail`` (line 41) is active here; a non-zero return from
+    # _spawn_handler_subagent would otherwise abort the whole script before
+    # ``SPAWN_RC=$?`` can capture it — which would skip the dedup (rc=2) and
+    # generic-failure (rc=1) cleanup paths and crash the tick mid-loop, so
+    # the rest of the notification queue never fires. coderabbit caught
+    # on PR #35. Capture via ``|| SPAWN_RC=$?`` so failures do not trip errexit.
+    SPAWN_RC=0
+    _spawn_handler_subagent "$EVENT" "$PR_KEY" "$TEXT" || SPAWN_RC=$?
+    case "$SPAWN_RC" in
+        0)
+            echo "$LOG_PREFIX 🤖 Spawned handler subagent for $PR_KEY ($EVENT)"
+            # Only now mark the SHA as notified. A failed spawn stays "not
+            # notified" in state so the next tick retries immediately instead
+            # of waiting for RENOTIFY_MINUTES.
+            if [ -n "$STATE_KEY" ] && [ -n "$STATE_SHA_KEY" ] && [ -n "$STATE_TS" ]; then
+                jq --arg state_key "$STATE_KEY" --arg sha_key "$STATE_SHA_KEY" --arg ts "$STATE_TS" \
+                    '.[$state_key][$sha_key] = $ts' "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+            fi
+            ;;
+        2)
+            # Dedup skip: a handler for this PR is already running. Drop the
+            # freshly-written envelope file so /tmp doesn't accumulate stale
+            # envelopes, and leave the notified-review state un-marked so
+            # this tick is a no-op and the next tick re-evaluates once the
+            # in-flight handler finishes.
+            rm -f "$ENVELOPE_FILE"
+            ;;
+        *)
+            # Generic spawn failure: already logged inside _spawn_handler_subagent.
+            # Drop the envelope so /tmp doesn't accumulate; next tick retries.
+            rm -f "$ENVELOPE_FILE"
+            ;;
+    esac
 done
 
 # ─── Merge/notification events (PR-lifecycle bookkeeping, not reviews) ────
