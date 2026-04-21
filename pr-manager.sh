@@ -254,13 +254,36 @@ _spawn_handler_subagent() {
         echo "$LOG_PREFIX     ⚠️  Could not list existing handler crons for $pr_key ($event); skipping spawn this tick" >&2
         return 1
     fi
-    if printf '%s\n' "$cron_jobs_json" \
-        | jq -e --arg prefix "pr-handler-${event}-${pr_prefix}" '
-            [.jobs[]?
-             | select(.name | sub("-[0-9]+$"; "") == $prefix)
-            ] | length > 0' >/dev/null 2>&1; then
+    # jq exit-code discipline (gemini flagged on PR #36):
+    #   exit 0 → filter matched = dedup (rc=2)
+    #   exit 1 → filter returned false/null = no dupe, safe to proceed
+    #   exit >= 2 → jq failed to parse its input OR the filter raised an
+    #                error (e.g. schema-validation ``error(...)`` below)
+    #                = control-plane failure, skip this tick (rc=1) to
+    #                  avoid fail-open duplicate-spawn. Using here-string
+    #                  keeps the check single-process (no pipe) so $?
+    #                  reflects jq directly without PIPESTATUS gymnastics.
+    #
+    # Schema hardening (coderabbit flagged on PR #37): a bare ``.jobs[]?``
+    # SUPPRESSES missing-key errors, so a valid-JSON-wrong-shape payload
+    # (e.g. ``{"error":"rate_limited"}`` from a degraded control plane)
+    # would yield an empty array, length-check false, exit 1 — which we
+    # would then treat as "safe to spawn". That's the exact fail-open
+    # this guard exists to prevent. Validate ``.jobs`` is an array first
+    # and explicitly ``error()`` otherwise so jq exits >=2 and lands on
+    # the fail-closed branch below.
+    if jq -e --arg prefix "pr-handler-${event}-${pr_prefix}" '
+            if (.jobs | type) != "array" then
+              error("invalid cron list payload: .jobs missing or not an array")
+            else
+              any(.jobs[]?;
+                  ((.name? // "") | sub("-[0-9]+$"; "")) == $prefix)
+            end' <<< "$cron_jobs_json" >/dev/null 2>&1; then
         echo "$LOG_PREFIX     ⏭️  Handler already scheduled or running for $pr_key ($event); skipping spawn" >&2
         return 2
+    elif [ $? -ge 2 ]; then
+        echo "$LOG_PREFIX     ⚠️  Handler cron list JSON was malformed or not shaped as expected for $pr_key ($event); skipping spawn this tick" >&2
+        return 1
     fi
 
     # Fire and forget — ``--at 10s --delete-after-run`` creates a one-shot
