@@ -254,13 +254,23 @@ _spawn_handler_subagent() {
         echo "$LOG_PREFIX     ⚠️  Could not list existing handler crons for $pr_key ($event); skipping spawn this tick" >&2
         return 1
     fi
-    if printf '%s\n' "$cron_jobs_json" \
-        | jq -e --arg prefix "pr-handler-${event}-${pr_prefix}" '
+    # jq exit-code discipline (gemini flagged on PR #36):
+    #   exit 0 → filter matched = dedup (rc=2)
+    #   exit 1 → filter returned false/null = no dupe, safe to proceed
+    #   exit >= 2 → jq failed to parse its input or hit an internal error
+    #                = control-plane failure, skip this tick (rc=1) to
+    #                  avoid fail-open duplicate-spawn. Using here-string
+    #                  keeps the check single-process (no pipe) so $?
+    #                  reflects jq directly without PIPESTATUS gymnastics.
+    if jq -e --arg prefix "pr-handler-${event}-${pr_prefix}" '
             [.jobs[]?
              | select(.name | sub("-[0-9]+$"; "") == $prefix)
-            ] | length > 0' >/dev/null 2>&1; then
+            ] | length > 0' <<< "$cron_jobs_json" >/dev/null 2>&1; then
         echo "$LOG_PREFIX     ⏭️  Handler already scheduled or running for $pr_key ($event); skipping spawn" >&2
         return 2
+    elif [ $? -ge 2 ]; then
+        echo "$LOG_PREFIX     ⚠️  Could not parse handler cron list JSON for $pr_key ($event); skipping spawn this tick" >&2
+        return 1
     fi
 
     # Fire and forget — ``--at 10s --delete-after-run`` creates a one-shot
