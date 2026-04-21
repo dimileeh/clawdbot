@@ -214,17 +214,28 @@ _spawn_handler_subagent() {
         return 1
     fi
 
-    # Dedup guard: suppress spawn if a handler for the same PR is already
-    # running. Without this, every tick (every 5 min) re-spawns a new
-    # isolated Opus session for the same PR while the previous one is still
-    # mid-flight — observed 2026-04-21: 14 overlapping handlers for one PR
-    # in a single night, each reading a stale envelope and thrashing on
-    # already-resolved threads until their timeout expired.
+    # Dedup guard: suppress spawn if a handler for the same PR+event is
+    # already scheduled or running. Without this, every tick (every 5 min)
+    # re-spawns a new isolated Opus session for the same PR while the
+    # previous one is still mid-flight — observed 2026-04-21: 14 overlapping
+    # handlers for one PR in a single night, each reading a stale envelope
+    # and thrashing on already-resolved threads until their timeout expired.
     #
-    # ``state.runningAtMs`` on a cron job is set when it fires and cleared
-    # when it finishes. We match on the PR-specific prefix of the cron job
-    # name. Deleted-after-run jobs that finished successfully are already
-    # gone from the listing, so this only catches truly in-flight handlers.
+    # Match strategy: strip the trailing ``-<unix_timestamp>`` suffix from
+    # each cron job's name and compare the remainder EXACTLY to the
+    # PR+event-specific prefix. This is strictly stricter than ``startswith``
+    # so ``pr-handler-review_comments-owner-repo-31-*`` cannot collide with
+    # ``pr-handler-review_comments-owner-repo-316-*`` (current code's
+    # trailing ``-`` already disambiguates these cases but defence-in-depth
+    # keeps us robust to future naming-format changes). gemini-code-assist
+    # flagged on PR #35.
+    #
+    # We do NOT filter on ``state.runningAtMs != null``: a cron job scheduled
+    # ``--at 10s`` is in the list but not yet firing for its first 10s, and
+    # under scheduler backpressure the window grows. Either state (queued or
+    # running) is in-flight for our purposes. ``--delete-after-run`` ensures
+    # finished jobs disappear from the listing automatically, so any surviving
+    # matching entry is genuinely unresolved work.
     #
     # Returns 2 on dedup skip so callers can distinguish "failed to spawn"
     # (return 1, retry next tick) from "didn't spawn because in-flight"
@@ -233,12 +244,11 @@ _spawn_handler_subagent() {
     local pr_prefix
     pr_prefix=$(echo "$pr_key" | tr '/#' '--')
     if openclaw cron list --json 2>/dev/null \
-        | jq -e --arg prefix "pr-handler-${event}-${pr_prefix}-" '
+        | jq -e --arg prefix "pr-handler-${event}-${pr_prefix}" '
             [.jobs[]?
-             | select(.name | startswith($prefix))
-             | select((.state // {}) | .runningAtMs != null)
+             | select(.name | sub("-[0-9]+$"; "") == $prefix)
             ] | length > 0' >/dev/null 2>&1; then
-        echo "$LOG_PREFIX     ⏭️  Handler already running for $pr_key ($event); skipping spawn" >&2
+        echo "$LOG_PREFIX     ⏭️  Handler already scheduled or running for $pr_key ($event); skipping spawn" >&2
         return 2
     fi
 
