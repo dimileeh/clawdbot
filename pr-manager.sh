@@ -788,15 +788,14 @@ Step 0 (staleness check, MANDATORY before any other work):
 
 The envelope was written by pr-manager at tick time, up to several minutes before this handler actually fires. The PR state may have moved on since then — the maintainer or another handler may have merged, closed, pushed new commits, or resolved threads. Acting on a stale envelope wastes the full per-handler token budget on no-ops and thrashes GitHub API calls against resolved threads.
 
-Before touching any file or thread, fetch CURRENT state with ``gh`` and cross-check against the envelope:
+Before touching any file or thread, fetch CURRENT state with gh and cross-check against the envelope:
 
-  a) ``gh pr view <pr_number> --repo <owner/repo> --json state,mergedAt,closedAt,headRefOid``
-     - If ``state`` != ``OPEN``: reply ``✅ <short-repo>#<n>: PR already <merged|closed>, no action taken`` and exit. Do NOT attempt commits or thread replies.
-     - If ``headRefOid`` != the envelope's ``head_sha``: new commits landed since the envelope was written. Reply ``⚠️ <short-repo>#<n> needs you — new commits landed since my task was queued`` and exit. Do NOT attempt to graft your own fixes onto a branch tip you haven't read.
+  a) Run: gh pr view <pr_number> --repo <owner/repo> --json state,mergedAt,closedAt,headRefOid
+     - If state != OPEN: reply '✅ <short-repo>#<n>: PR already merged/closed, no action taken' and exit. Do NOT attempt commits or thread replies.
+     - If headRefOid != the envelope's head_sha: new commits landed since the envelope was written. Reply '⚠️ <short-repo>#<n> needs you — new commits landed since my task was queued' and exit. Do NOT attempt to graft your own fixes onto a branch tip you haven't read.
 
-  b) Run the same GraphQL query the envelope used to count unresolved threads:
-       ``gh api graphql -f query='{repository(owner:"<owner>",name:"<repo>"){pullRequest(number:<n>){reviewThreads(first:50){nodes{id isResolved isOutdated}}}}}' | jq '.data.repository.pullRequest.reviewThreads.nodes | map(select(.isResolved == false and .isOutdated == false)) | length'``
-     - If 0 unresolved: reply ``✅ <short-repo>#<n>: all threads already resolved, no action taken`` and exit.
+  b) Run the same GraphQL query the envelope used to count unresolved threads. The graphql body should match the one the envelope-writer in pr-manager.sh uses: fetch reviewThreads (first:50) with id/isResolved/isOutdated, then filter isResolved == false AND isOutdated == false, and count.
+     - If 0 unresolved: reply '✅ <short-repo>#<n>: all threads already resolved, no action taken' and exit.
      - If the set differs significantly from the envelope (e.g. envelope listed 5 threads, only 1 unresolved now): work only the currently-unresolved subset. Do not reply to or re-open threads that are already resolved.
 
 This check costs you ~2 tool calls and under 5 seconds. Skipping it costs up to 90 minutes and a full Opus budget on work that was already done. Run it.
@@ -845,12 +844,12 @@ The envelope and the failing-job log tail were captured at pr-manager tick time,
 
 Before touching any file, fetch CURRENT state:
 
-  a) ``gh pr view <pr_number> --repo <owner/repo> --json state,mergedAt,closedAt,headRefOid``
-     - If ``state`` != ``OPEN``: reply ``✅ <short-repo>#<n>: PR already <merged|closed>, no action taken`` and exit.
-     - If ``headRefOid`` != the envelope's ``head_sha``: reply ``⚠️ <short-repo>#<n> needs you — new commits landed since my task was queued`` and exit.
+  a) Run: gh pr view <pr_number> --repo <owner/repo> --json state,mergedAt,closedAt,headRefOid
+     - If state != OPEN: reply '✅ <short-repo>#<n>: PR already merged/closed, no action taken' and exit.
+     - If headRefOid != the envelope's head_sha: reply '⚠️ <short-repo>#<n> needs you — new commits landed since my task was queued' and exit.
 
-  b) ``gh pr checks <pr_number> --repo <owner/repo>``
-     - If CI is now green or the failing job is re-running: reply ``✅ <short-repo>#<n>: CI already re-ran green, no action taken`` and exit (or wait briefly if mid-retry, but do not duplicate-fix).
+  b) Run: gh pr checks <pr_number> --repo <owner/repo>
+     - If CI is now green or the failing job is re-running: reply '✅ <short-repo>#<n>: CI already re-ran green, no action taken' and exit (or wait briefly if mid-retry, but do not duplicate-fix).
 
 This check is cheap. Skipping it burns the full handler budget on already-fixed failures.
 
