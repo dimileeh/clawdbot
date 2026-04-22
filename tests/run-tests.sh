@@ -420,6 +420,12 @@ else
 fi
 echo ""
 
+# NOTE: Layer 5 previously unit-tested a `_detect_test_cmd` helper that
+# lived in pr-manager.sh. That helper was removed by this PR (handler-spawn
+# test-command detection moved out of pr-manager into the handler skill
+# itself), so its tests no longer have anything to source. Dropped rather
+# than ported because the function they covered no longer exists.
+
 # ─── Layer 5d: CI log redaction ──────────────────────────────────
 echo "Layer 5d: CI log redaction"
 
