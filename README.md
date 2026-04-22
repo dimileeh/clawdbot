@@ -27,12 +27,16 @@ swarm-monitor.sh (*/3 cron) ──── check-agents.sh
    ├── conflict?         → wake orchestrator to rebase
    └── nothing changed?  → exit silently (zero cost)
    
-pr-manager.sh (*/10 cron)
+pr-manager.sh (*/5 cron)
    │
    ├── auto-merge safe integration PRs
-   ├── spawn review-fix agents for unresolved threads
-   ├── spawn CI-fix agents for failing checks
+   ├── wake Sparky with structured JSON when a PR has unresolved review comments
+   ├── wake Sparky with failed-job logs when CI is red
    └── open integration→main sync PRs when queue drains
+
+Sparky (the OpenClaw orchestrator) then aggregates, plans, and decides
+whether to fix inline or delegate to a swarm agent. Bash never spawns
+fix agents directly.
 
 human reviews and merges main-targeted PRs
 ```
@@ -132,8 +136,8 @@ crontab -e
 # Agent pre-check (validate GitHub API, repos accessible)
 */10 * * * * /home/YOU/.clawdbot/agent-precheck.sh >> /home/YOU/.clawdbot/logs/precheck.log 2>&1
 
-# PR manager (merge, review-fix, sync PRs)
-*/10 * * * * /home/YOU/.clawdbot/pr-manager.sh >> /home/YOU/.clawdbot/logs/pr-manager.log 2>&1
+# PR manager (merge, notify Sparky on comments / CI failures, sync PRs)
+*/5 * * * * /home/YOU/.clawdbot/pr-manager.sh >> /home/YOU/.clawdbot/logs/pr-manager.log 2>&1
 
 # Swarm monitor (zero-LLM, wakes orchestrator only on events)
 */3 * * * * /home/YOU/.clawdbot/swarm-monitor.sh
@@ -154,19 +158,35 @@ Add this to your workspace `AGENTS.md` (or `HEARTBEAT.md`):
 - Spawn agents: `~/.clawdbot/spawn-agent.sh <task-id> <repo-path> <branch-name> <agent: codex|claude|gemini> <model> <thinking: low|medium|high|xhigh> "<prompt>"`
 - Check status: `~/.clawdbot/check-agents.sh`
 - Clean up: `~/.clawdbot/cleanup-task.sh <task-id>`
-- PR status: `~/.clawdbot/pr-unified-status.sh`
+- PR status: watch `~/.clawdbot/logs/pr-manager.log` (emitted every 5 minutes by `pr-manager.sh`).
 ```
 
-### 2. Install the swarm skill (recommended)
+### 2. Install the skills (recommended)
 
-The swarm skill (`SKILL.md` in this repo) gives your agent structured knowledge of the full spawn → monitor → review → merge lifecycle. Copy it into your OpenClaw skills directory:
+clawdbot ships two skills under `skills/` that give your OpenClaw agent structured knowledge of the full lifecycle:
+
+- **`skills/swarm/SKILL.md`** — the **swarm** skill: spawning coding agents, choosing the right model, monitoring tmux sessions, delegating work.
+- **`skills/pr-review-hygiene/SKILL.md`** — the **pr-review-hygiene** skill: how the orchestrator should consume `pr-manager.sh`'s wake events, the triage → fix → push → verify → reply → resolve loop, and the rules for when NOT to resolve a thread.
+
+Install both with a single loop that preserves each skill's directory name:
 
 ```bash
-mkdir -p ~/.openclaw/skills/swarm
-cp ~/.clawdbot/SKILL.md ~/.openclaw/skills/swarm/SKILL.md
+for skill in ~/.clawdbot/skills/*/; do
+  name=$(basename "$skill")
+  mkdir -p "$HOME/.openclaw/skills/$name"
+  cp "$skill/SKILL.md" "$HOME/.openclaw/skills/$name/SKILL.md"
+done
 ```
 
-With the skill installed, you can just say *"spawn a Codex agent to fix the auth bug in my-backend"* and your agent handles the rest — worktree creation, prompt injection, tmux session, and monitoring.
+Or install individually:
+
+```bash
+mkdir -p ~/.openclaw/skills/swarm ~/.openclaw/skills/pr-review-hygiene
+cp ~/.clawdbot/skills/swarm/SKILL.md ~/.openclaw/skills/swarm/SKILL.md
+cp ~/.clawdbot/skills/pr-review-hygiene/SKILL.md ~/.openclaw/skills/pr-review-hygiene/SKILL.md
+```
+
+With the skills installed, you can just say *"spawn a Codex agent to fix the auth bug in my-backend"* (swarm) or let `pr-manager.sh` wake your agent with a structured review envelope (pr-review-hygiene). The agent loads the relevant skill and handles the full loop — worktree creation, prompt injection, thread replies + resolves, and reporting back.
 
 ### 3. How the pieces connect
 
@@ -242,34 +262,30 @@ Every script sources `.env` on startup with safe fallbacks, so existing env vars
 
 ```
 ~/.clawdbot/
-├── .env                  # Local config (gitignored)
-├── .env.example          # Template for .env
-├── AGENTS.md             # Instructions injected into every agent
+├── .env                        # Local config (gitignored)
+├── .env.example               # Template for .env
+├── AGENTS.md                  # Instructions injected into every agent
 ├── README.md
 ├── LICENSE
-├── spawn-agent.sh        # Spawn a coding agent in a worktree
-├── check-agents.sh       # Check status of all tracked tasks
-├── cleanup-task.sh       # Clean up finished task worktree
-├── finalize-task.sh      # Auto-called on agent exit
-├── agent-precheck.sh     # Validate GitHub API + repo access
-├── github-precheck.sh    # Extended GitHub health check
+├── spawn-agent.sh             # Spawn a coding agent in a worktree
+├── check-agents.sh            # Check status of all tracked tasks (swarm)
+├── cleanup-task.sh            # Clean up finished task worktree
+├── finalize-task.sh           # Auto-called on agent exit
+├── agent-precheck.sh          # Validate GitHub API + repo access (swarm)
 │
-├── pr-manager.sh         # PR automation: merge, review-fix, sync
-├── swarm-monitor.sh      # Zero-LLM monitor (cron, wakes on events)
-├── pr-hygiene.sh         # PR health checks and cleanup
-├── pr-review-collector.sh    # Collect review comments
-├── pr-unified-status.sh      # Unified PR status across repos
-├── check-pr-ready.sh         # Check if PR is ready to merge
-├── check-pr-reviews.sh       # Check PR review status
-├── check-pr-review-debt.sh   # Track review debt
-├── check-cursor-risk.sh      # Cursor Bugbot risk assessment
-├── auto-resolve-praise-threads.sh  # Auto-resolve "looks good" threads
+├── pr-manager.sh              # GitHub PR watchdog — merges, notifies Sparky
+├── pr-review-collector.sh     # Emit unresolved review threads as JSON
+├── swarm-monitor.sh           # Zero-LLM swarm monitor (cron, 3 min)
 │
-├── logs/                 # Cron output (gitignored)
-├── prompts/              # Agent prompt files (gitignored)
-├── runners/              # tmux session metadata (gitignored)
-├── memory/               # Agent memory files (gitignored)
-└── *.json                # State files (gitignored)
+├── skills/                    # Orchestrator skills (copy into ~/.openclaw/skills/)
+│   ├── swarm/SKILL.md             # Spawning and orchestrating coding agents
+│   └── pr-review-hygiene/SKILL.md # Consuming pr-manager wakes: triage, fix, reply, resolve
+│
+├── logs/                      # Cron output (gitignored)
+├── prompts/                   # Agent prompt files (gitignored)
+├── runners/                   # tmux session metadata (gitignored)
+├── memory/                    # Agent memory files (gitignored)
+└── *.json                     # State files (gitignored)
 ```
 
 ## Usage
@@ -310,10 +326,18 @@ Returns JSON with task IDs, statuses, PR numbers, CI state, and recommended acti
 
 ### PR status across repos
 
+`pr-manager.sh` runs every 5 minutes via crontab and emits the current state
+of every open PR to `~/.clawdbot/logs/pr-manager.log`. For an on-demand
+snapshot of just unresolved review threads, run the collector directly:
+
 ```bash
-~/.clawdbot/pr-unified-status.sh    # Overview of all open PRs
-~/.clawdbot/check-pr-ready.sh       # Which PRs are ready to merge
-~/.clawdbot/check-pr-review-debt.sh # Which PRs need review attention
+~/.clawdbot/pr-review-collector.sh | jq .
+```
+
+Or trigger `pr-manager.sh` ahead of schedule:
+
+```bash
+~/.clawdbot/pr-manager.sh 2>&1 | tail -50
 ```
 
 ### Clean up a finished task

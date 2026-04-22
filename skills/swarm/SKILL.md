@@ -76,7 +76,7 @@ Tell the user what you're spawning and why.
 ```
 cron(action='update', jobId='04380832-9e24-48ba-af0c-439c42c0c4df', patch={enabled: true})
 ```
-This runs every 3 minutes, announces completions to Dmitri, and **auto-disables itself** when all tasks are done/failed. Zero token waste when idle.
+This runs every 3 minutes, announces completions to the maintainer, and **auto-disables itself** when all tasks are done/failed. Zero token waste when idle.
 
 You can also manually check:
 

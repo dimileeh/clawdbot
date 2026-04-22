@@ -169,7 +169,7 @@ cp "$PROMPT_FILE" "$WORKTREE_PROMPT_FILE"
 # ── Build agent command (interactive mode, prompt file as instruction) ──
 # Elvis's approach: interactive mode in tmux (not exec), enables multi-step work + mid-task steering
 if [ "$AGENT" = "codex" ]; then
-  # Enforce Dmitri preference: Codex always runs as GPT-5.3 Codex with xhigh reasoning.
+  # Team preference: Codex always runs as GPT-5.3 Codex with xhigh reasoning.
   # IMPORTANT: Codex CLI expects bare model name (no provider prefix) for current auth mode.
   MODEL="gpt-5.3-codex"
   THINKING="xhigh"
