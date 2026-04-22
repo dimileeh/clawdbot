@@ -18,7 +18,7 @@
 #   pr-ack-outside-diff.sh <pr_key> <review_id> <body_hash> <commit_sha> <summary>
 #
 # Arguments:
-#   pr_key       e.g. dimileeh/aira-agent#325
+#   pr_key       e.g. owner/repo#325
 #   review_id    numeric review id from envelope.outside_diff_reviews[].review_id
 #                (must match pr-manager marker parser contract: review=([0-9]+);
 #                strip any GraphQL node prefix like "PRR_..." before calling)

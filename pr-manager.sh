@@ -738,7 +738,7 @@ for REPO in $REPOS; do
                         jq --arg key "$SHA_KEY" --arg ts "$NOW_ISO" \
                             '.first_seen_unresolved[$key] = $ts' "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
                         if [ "$BYPASS_COOLDOWN" -eq 1 ]; then
-                            echo "$LOG_PREFIX     ⏩ First observation at this SHA but dispatch present — proceeding immediately"
+                            echo "$LOG_PREFIX     ⏩ First observation at this SHA but bypass active (${BYPASS_REASON:-unknown}) — proceeding immediately"
                         else
                             echo "$LOG_PREFIX     ⏱️ First observation at this SHA — starting ${REVIEW_WAIT_MINUTES}m review wait window"
                             continue
@@ -781,8 +781,8 @@ for REPO in $REPOS; do
                     # PR diff — unchanged files affected by the PR, test
                     # helpers, cache invalidation points, webhook replay
                     # scope, etc. These were completely invisible to handlers
-                    # until today; a 2026-04-21 handler run on aira-agent#325
-                    # closed all 19 inline threads but missed 3 outside-diff
+                    # until today; a 2026-04-21 handler run on a heavy
+                    # review PR closed all 19 inline threads but missed 3 outside-diff
                     # findings + 1 nitpick from the same CodeRabbit review
                     # submission. We pull review bodies authored by known
                     # review bots, keep only the LATEST submission per
@@ -811,15 +811,14 @@ for REPO in $REPOS; do
                         # outside-diff / outside-thread actionable content.
                         # Markers we have seen in the wild:
                         #   "Outside diff range comments"   (CodeRabbit)
-                        #   "can’t be posted inline"          (CodeRabbit)
-                        #   "can\u2019t be posted inline"     (CodeRabbit, escaped)
+                        #   "cannot be posted inline" phrasing (apostrophe may be ASCII or U+2019) (CodeRabbit)
                         #   "Prompt for all review comments with AI agents"
                         #                                     (CodeRabbit, ingest-ready)
                         #   "Nitpick comments"               (CodeRabbit)
                         #   "actionable comments posted"    (CodeRabbit)
                         #   "Additional Comments"           (Greptile)
                         #   "P1 Badge" / "P2 Badge"          (chatgpt-codex-connector)
-                        | map(select((.body // "") | test("Outside diff range|can’t be posted inline|Prompt for all review|Nitpick comments|Actionable comments posted|Additional [Cc]omments|P[12] Badge"; "i")))
+                        | map(select((.body // "") | test("Outside diff range|can.t be posted inline|Prompt for all review|Nitpick comments|Actionable comments posted|Additional [Cc]omments|P[12] Badge"; "i")))
                         # Drop reviews that have already been acked with the
                         # matching body_hash. Handler posts a PR comment
                         # when it addresses outside-diff findings; see
@@ -1151,7 +1150,7 @@ INSTRUCTIONS
 2b. HOW TO ACKNOWLEDGE OUTSIDE-DIFF FINDINGS. Outside-diff review bodies have NO GitHub ``resolve`` button — they are NOT threads. If you just fix the code and push, the next pr-manager tick would re-surface the same review to a fresh handler (infinite loop). The ack channel is a PR-level comment with an HTML marker. For EACH outside-diff review you address, run:
     $HOME/.clawdbot/pr-ack-outside-diff.sh <pr_key> <review_id> <body_hash> <commit_sha> <summary>
   where <pr_key> is ``${PR_KEY}``, <review_id> is the ``review_id`` field from the envelope's ``outside_diff_reviews`` entry, <body_hash> is the ``body_hash`` field from the same entry, <commit_sha> is the full or short SHA of the commit that addressed the findings, and <summary> is a one-line plain-English summary. The script posts a hidden HTML marker comment that pr-manager reads on the next tick to suppress the review. If the review body changes later (bot added new findings to the same review), the body_hash changes and the review re-surfaces automatically — so you don't need to worry about future review updates.
-  Skipping the ack means the next handler spawn re-processes the same findings. Always ack after fixing. 2026-04-21 aira-agent#325 missed 3 outside-diff findings + 1 nitpick; this ack channel is how we prevent that failure mode in future.
+  Skipping the ack means the next handler spawn re-processes the same findings. Always ack after fixing. The 2026-04-21 incident that motivated this channel had a handler miss 3 outside-diff findings + 1 nitpick on a heavy review; this ack channel is how we prevent that failure mode in future.
 3. Emit ZERO intermediate assistant text. Every assistant message gets announced to the maintainer's Telegram, so intermediate 'Now let me...' narrations spam the chat. Do all reasoning silently via tool-use. Produce exactly ONE final text reply at the end.
 4. If you cannot proceed without a product/design call, DO NOT use ``sessions_send``. Instead, persist the question to the followup file at ``$HOME/.clawdbot/followups/${PR_KEY_SAFE}.json`` as JSON with three string fields — awaiting_input (a one-sentence question), threads (array of affected thread_ids), and detail (what you need and why). Overwrite the file if it already exists (your new question supersedes any prior one). Then exit with a ⚠️ Telegram reply. The maintainer will answer by adding a dispatch field to the same file; the NEXT pr-manager tick will fold that dispatch into a fresh handler envelope, bypassing the review-wait and cooldown windows. This replaces the old sessions_send escalation channel which was unreliable because handler sessions exit before the maintainer reply lands.
 4a. If the envelope you received contains ``maintainer_dispatch`` (non-empty), that is the maintainer's answer to a PRIOR escalation on this PR. Execute against that dispatch as your primary instruction, cross-referenced against the current list of unresolved threads. The maintainer's dispatch supersedes any default handling heuristic.

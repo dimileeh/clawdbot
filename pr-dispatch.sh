@@ -22,7 +22,7 @@
 #   pr-dispatch.sh <pr_key> <plan_text_or_- >
 #
 # Arguments:
-#   pr_key      e.g. ``dimileeh/aira-agent#325``
+#   pr_key      e.g. ``owner/repo#325``
 #   plan        the dispatch text. If ``-`` read from stdin.
 #
 # The pr_key is converted to a safe filename the same way pr-manager.sh
@@ -36,7 +36,7 @@ mkdir -p "$FOLLOWUPS_DIR"
 
 if [ $# -lt 2 ]; then
     echo "usage: $0 <pr_key> <plan | ->" >&2
-    echo "  pr_key examples: dimileeh/aira-agent#325, dimileeh/aira-web#259" >&2
+    echo "  pr_key examples: owner/repo#325, owner/other-repo#259" >&2
     exit 2
 fi
 
