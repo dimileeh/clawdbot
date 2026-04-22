@@ -218,7 +218,11 @@ cat > "$TEST_TMP/python-with-bash/tests/run-tests.sh" <<'EOF'
 exit 0
 EOF
 result=$(_detect_test_cmd "$TEST_TMP/python-with-bash")
-if [[ "$result" == *"pytest"* ]]; then
+# Tightened: must be pytest AND must NOT include the bash harness path,
+# so a regression that mixed both commands into one string (e.g. a future
+# ``pytest && ./tests/run-tests.sh``) would fail this assertion instead
+# of passing on the substring alone.
+if [[ "$result" == *"pytest"* && "$result" != *"tests/run-tests.sh"* ]]; then
     pass "_detect_test_cmd prefers Python harness over bash fallback"
 else
     fail "_detect_test_cmd prefers Python harness over bash fallback (got: $result)"

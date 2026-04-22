@@ -430,6 +430,7 @@ for REPO in $REPOS; do
             reviews(first: 30) {
               nodes {
                 id
+                databaseId
                 state
                 author { login }
                 submittedAt
@@ -823,12 +824,21 @@ for REPO in $REPOS; do
                         # matching body_hash. Handler posts a PR comment
                         # when it addresses outside-diff findings; see
                         # pr-ack-outside-diff.sh.
+                        # Drop reviews that have already been acked with the
+                        # matching body_hash. We key on the numeric
+                        # ``databaseId`` (not the opaque GraphQL node id)
+                        # because the ack-marker parser at the top of
+                        # the loop scans for ``review=([0-9]+)`` — and
+                        # pr-ack-outside-diff.sh validates the same.
+                        # Keeping all three (envelope, ack script, parser)
+                        # on the numeric databaseId is the only way the
+                        # suppression round-trip closes.
                         | map(select(
                             . as $r
-                            | ($acked_pairs | any(.review_id == ($r.id | tostring) and .body_hash == $r.body_hash)) | not
+                            | ($acked_pairs | any(.review_id == ($r.databaseId | tostring) and .body_hash == $r.body_hash)) | not
                           ))
                         | map({
-                            review_id: .id,
+                            review_id: (.databaseId | tostring),
                             author: .author.login,
                             state: .state,
                             submitted_at: .submittedAt,

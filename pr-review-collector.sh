@@ -93,6 +93,12 @@ for REPO in $REPOS; do
                }
            ]
          }
+       # Skip PRs with an empty head_sha: downstream handlers compare
+       # their envelope''s head_sha against the live ``gh pr view`` result
+       # to detect staleness, and an empty string never matches the live
+       # SHA — the PR would be permanently classed as stale and never
+       # handled.
+       | select(.head_sha != "")
        | select(.unresolved_threads | length > 0)
       ]' 2>/dev/null || echo '[]')
 

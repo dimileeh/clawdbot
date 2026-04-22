@@ -41,7 +41,10 @@ if [ $# -lt 2 ]; then
 fi
 
 PR_KEY="$1"
-PLAN_ARG="$2"
+# Collect all arguments from position 2 onward so unquoted multi-word
+# plans (e.g. ``pr-dispatch.sh owner/repo#1 fix the flaky test``) are
+# preserved instead of silently truncated to just ``$2``.
+PLAN_ARG="${*:2}"
 
 if [ "$PLAN_ARG" = "-" ]; then
     PLAN_TEXT=$(cat)
@@ -69,18 +72,35 @@ NOW_ISO=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 # both the question the prior handler asked AND the maintainer's answer.
 # If no file exists yet, start from {} (maintainer can preempt an expected
 # escalation by dispatching proactively).
+# Read any existing followup payload in fail-closed mode: jq -e exits
+# 0 on truthy output, 1 on falsy output, and >=2 on parse/IO errors. We
+# treat a parse error as hard fail (corrupt file -> don't silently drop
+# prior escalation context), and only fall back to ``{}`` when the file
+# simply doesn't exist. Use ``-c`` so the accumulated JSON stays compact
+# for the downstream jq pipe.
 if [ -f "$FOLLOWUP_FILE" ]; then
-    EXISTING=$(jq -e . "$FOLLOWUP_FILE" 2>/dev/null || echo '{}')
+    set +e
+    EXISTING=$(jq -ce . "$FOLLOWUP_FILE" 2>/dev/null)
+    RC=$?
+    set -e
+    if [ $RC -ge 2 ]; then
+        echo "error: failed to parse $FOLLOWUP_FILE (jq rc=$RC)" >&2
+        exit 5
+    fi
+    if [ $RC -ne 0 ] || [ -z "$EXISTING" ]; then
+        EXISTING='{}'
+    fi
 else
     EXISTING='{}'
 fi
 
-jq -n \
-    --argjson existing "$EXISTING" \
+# Feed the prior payload via stdin to dodge argv size limits (E2BIG)
+# if the followup ever grows large (multi-handler escalation history).
+printf '%s' "$EXISTING" | jq \
     --arg dispatch "$PLAN_TEXT" \
     --arg dispatched_at "$NOW_ISO" \
     --arg pr_key "$PR_KEY" \
-    '$existing + {pr_key: $pr_key, dispatch: $dispatch, dispatched_at: $dispatched_at}' \
+    '. + {pr_key: $pr_key, dispatch: $dispatch, dispatched_at: $dispatched_at}' \
     > "$FOLLOWUP_FILE.tmp"
 
 mv "$FOLLOWUP_FILE.tmp" "$FOLLOWUP_FILE"

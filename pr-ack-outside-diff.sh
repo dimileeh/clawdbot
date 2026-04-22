@@ -58,11 +58,12 @@ if ! [[ "$PR_KEY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+$ ]]; then
     echo "error: pr_key must be owner/repo#N, got: $PR_KEY" >&2
     exit 3
 fi
-# review_id can be the raw graphql node id or a numeric — normalize to the
-# numeric we get in the envelope (pr-manager ships the GraphQL id as-is).
-# We don't parse it — just ensure it's a non-empty alphanumeric-ish token.
-if [[ -z "$REVIEW_ID" ]] || [[ ! "$REVIEW_ID" =~ ^[A-Za-z0-9_-]+$ ]]; then
-    echo "error: review_id must be a non-empty alphanumeric token, got: $REVIEW_ID" >&2
+# review_id MUST be numeric. pr-manager.sh's ack-marker parser only
+# recognizes ``review=([0-9]+)`` (see pr-manager.sh line ~525), so a
+# non-numeric id would post a comment successfully but never get read
+# back — the review would re-surface on every tick forever.
+if [[ -z "$REVIEW_ID" ]] || [[ ! "$REVIEW_ID" =~ ^[0-9]+$ ]]; then
+    echo "error: review_id must be numeric (pr-manager parser contract), got: $REVIEW_ID" >&2
     exit 4
 fi
 if ! [[ "$BODY_HASH" =~ ^[a-f0-9]{64}$ ]]; then
@@ -83,11 +84,17 @@ ${SUMMARY}"
 
 # Post the comment. gh pr comment is auth'd via GH_TOKEN or gh's login.
 # Captured stdout includes the comment URL on success.
-COMMENT_URL=$(gh pr comment "$PR_NUM" --repo "$REPO" --body "$BODY" 2>&1)
-RC=$?
-if [ $RC -ne 0 ]; then
+#
+# Note: the previous ``COMMENT_URL=$(...); RC=$?`` form was unreachable
+# under ``set -e`` because a failing command substitution in an
+# assignment exits immediately. Use ``if <assign>; then ... else`` so the
+# non-zero path actually runs.
+if COMMENT_URL=$(gh pr comment "$PR_NUM" --repo "$REPO" --body "$BODY" 2>&1); then
+    :
+else
+    RC=$?
     echo "error: gh pr comment failed (rc=$RC): $COMMENT_URL" >&2
-    exit $RC
+    exit "$RC"
 fi
 echo "acked review=$REVIEW_ID hash=$BODY_HASH on $PR_KEY (commit=$COMMIT_SHA)"
 echo "$COMMENT_URL"
