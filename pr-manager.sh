@@ -749,11 +749,27 @@ for REPO in $REPOS; do
                     if [ "$BYPASS_COOLDOWN" -eq 0 ]; then
                         PRIOR_SPAWN=$(jq -r ".handler_spawns[\"$SHA_KEY\"] // empty" "$STATE_FILE")
                         if [ -n "$PRIOR_SPAWN" ]; then
-                            PRIOR_UNRESOLVED=$(echo "$PRIOR_SPAWN" | jq -r '.unresolved_count // -1')
-                            if [ "$PRIOR_UNRESOLVED" != "-1" ] && [ "$UNRESOLVED" -ge "$PRIOR_UNRESOLVED" ]; then
+                            # Compare like-for-like: inline-only vs
+                            # inline-only. The older schema stored the
+                            # TOTAL (inline + outside-diff) in
+                            # unresolved_count, which made UNRESOLVED
+                            # (inline only) always fall short of the
+                            # total and masked genuine no-ops when the
+                            # prior spawn had outside-diff findings.
+                            # We now persist an explicit
+                            # inline_unresolved_count field (coderabbit
+                            # PR#39 _BzXV); fall back to the legacy
+                            # unresolved_count for state files written
+                            # before this change, with the caveat that
+                            # older entries may report the inflated total.
+                            # The legacy fallback can over-detect
+                            # silent-no-ops on state written by the old
+                            # schema — benign: an extra spawn at worst.
+                            PRIOR_INLINE=$(echo "$PRIOR_SPAWN" | jq -r '.inline_unresolved_count // .unresolved_count // -1')
+                            if [ "$PRIOR_INLINE" != "-1" ] && [ "$UNRESOLVED" -ge "$PRIOR_INLINE" ]; then
                                 BYPASS_COOLDOWN=1
                                 BYPASS_REASON="silent-no-op-retry"
-                                echo "$LOG_PREFIX     🔁 Prior handler on $SHA_KEY was a no-op (unresolved was $PRIOR_UNRESOLVED, still $UNRESOLVED); bypassing cooldown for retry"
+                                echo "$LOG_PREFIX     🔁 Prior handler on $SHA_KEY was a no-op (inline unresolved was $PRIOR_INLINE, still $UNRESOLVED); bypassing cooldown for retry"
                             fi
                         fi
                     fi
@@ -1096,12 +1112,44 @@ for BLOB in "${NOTIFY_BLOBS[@]}"; do
     FOLLOWUP_DISPATCH=""
     FOLLOWUP_BLOB='{}'
     HAS_DISPATCH=0
+    # Event + head_sha scoping (coderabbit PR#39 _BzXb). A followup
+    # file keyed only by PR_KEY is ambiguous: a dispatch answering a
+    # ``review_comments`` escalation could be mis-consumed by the next
+    # ``ci_failed`` spawn on the same PR. We scope consumption to the
+    # event (and the head_sha) the dispatch was written for. Handlers
+    # that escalate persist ``.event`` and ``.head_sha`` alongside
+    # ``.awaiting_input``; pr-dispatch.sh preserves those fields. If
+    # the stored scope is absent (maintainer-first proactive dispatch,
+    # or a followup written before this change), fall through to the
+    # legacy unscoped behavior.
+    CURRENT_EVENT="$EVENT"
+    CURRENT_HEAD_SHA=$(echo "$BLOB" | jq -r '.head_sha // ""')
     if [ -f "$FOLLOWUP_FILE" ]; then
         if FOLLOWUP_BLOB=$(jq -e . "$FOLLOWUP_FILE" 2>/dev/null); then
+            FOLLOWUP_EVENT=$(echo "$FOLLOWUP_BLOB" | jq -r '.event // ""')
+            FOLLOWUP_HEAD_SHA=$(echo "$FOLLOWUP_BLOB" | jq -r '.head_sha // ""')
             FOLLOWUP_DISPATCH=$(echo "$FOLLOWUP_BLOB" | jq -r '.dispatch // ""')
-            if [ -n "$FOLLOWUP_DISPATCH" ]; then
+            # Event match: if stored event is present, require it.
+            EVENT_OK=1
+            if [ -n "$FOLLOWUP_EVENT" ] && [ "$FOLLOWUP_EVENT" != "$CURRENT_EVENT" ]; then
+                EVENT_OK=0
+            fi
+            # head_sha match: if stored sha is present AND current sha
+            # is known, require them to match so we don't consume a
+            # dispatch whose premises (the code state) have moved on.
+            SHA_OK=1
+            if [ -n "$FOLLOWUP_HEAD_SHA" ] && [ -n "$CURRENT_HEAD_SHA" ] && [ "$FOLLOWUP_HEAD_SHA" != "$CURRENT_HEAD_SHA" ]; then
+                SHA_OK=0
+            fi
+            if [ -n "$FOLLOWUP_DISPATCH" ] && [ "$EVENT_OK" -eq 1 ] && [ "$SHA_OK" -eq 1 ]; then
                 HAS_DISPATCH=1
-                echo "$LOG_PREFIX     📩 Maintainer dispatch present for $PR_KEY; folding into envelope and bypassing cooldown"
+                echo "$LOG_PREFIX     📩 Maintainer dispatch present for $PR_KEY (event=$CURRENT_EVENT); folding into envelope and bypassing cooldown"
+            elif [ -n "$FOLLOWUP_DISPATCH" ]; then
+                echo "$LOG_PREFIX     ⏭️  Skipping followup dispatch for $PR_KEY: event_ok=$EVENT_OK sha_ok=$SHA_OK (stored event=$FOLLOWUP_EVENT sha=$FOLLOWUP_HEAD_SHA; current event=$CURRENT_EVENT sha=$CURRENT_HEAD_SHA)"
+                # Clear the followup blob from the envelope-folding path
+                # so maintainer_dispatch/prior_escalation fields are NOT
+                # folded into this mismatched envelope.
+                FOLLOWUP_BLOB='{}'
             fi
         else
             echo "$LOG_PREFIX     ⚠️  Followup file for $PR_KEY is malformed JSON; ignoring" >&2
@@ -1176,7 +1224,7 @@ INSTRUCTIONS
   where <pr_key> is ``${PR_KEY}``, <review_id> is the ``review_id`` field from the envelope's ``outside_diff_reviews`` entry, <body_hash> is the ``body_hash`` field from the same entry, <commit_sha> is the full or short SHA of the commit that addressed the findings, and <summary> is a one-line plain-English summary. The script posts a hidden HTML marker comment that pr-manager reads on the next tick to suppress the review. If the review body changes later (bot added new findings to the same review), the body_hash changes and the review re-surfaces automatically — so you don't need to worry about future review updates.
   Skipping the ack means the next handler spawn re-processes the same findings. Always ack after fixing. The 2026-04-21 incident that motivated this channel had a handler miss 3 outside-diff findings + 1 nitpick on a heavy review; this ack channel is how we prevent that failure mode in future.
 3. Emit ZERO intermediate assistant text. Every assistant message gets announced to the maintainer's Telegram, so intermediate 'Now let me...' narrations spam the chat. Do all reasoning silently via tool-use. Produce exactly ONE final text reply at the end.
-4. If you cannot proceed without a product/design call, DO NOT use ``sessions_send``. Instead, persist the question to the followup file at ``$HOME/.clawdbot/followups/${PR_KEY_SAFE}.json`` as JSON with three string fields — awaiting_input (a one-sentence question), threads (array of affected thread_ids), and detail (what you need and why). Overwrite the file if it already exists (your new question supersedes any prior one). Then exit with a ⚠️ Telegram reply. The maintainer will answer by adding a dispatch field to the same file; the NEXT pr-manager tick will fold that dispatch into a fresh handler envelope, bypassing the review-wait and cooldown windows. This replaces the old sessions_send escalation channel which was unreliable because handler sessions exit before the maintainer reply lands.
+4. If you cannot proceed without a product/design call, DO NOT use ``sessions_send``. Instead, persist the question to the followup file at ``$HOME/.clawdbot/followups/${PR_KEY_SAFE}.json`` as JSON with these string fields: awaiting_input (a one-sentence question), threads (array of affected thread_ids), detail (what you need and why), AND event + head_sha (copy these from THIS envelope — event is the string review_comments and head_sha comes from envelope.head_sha) so the maintainer's dispatch is only consumed by a handler firing on the same event+SHA. Overwrite the file if it already exists (your new question supersedes any prior one). Then exit with a ⚠️ Telegram reply. The maintainer will answer by adding a dispatch field to the same file; the NEXT pr-manager tick will fold that dispatch into a fresh handler envelope matching the same event+SHA, bypassing the review-wait and cooldown windows. This replaces the old sessions_send escalation channel which was unreliable because handler sessions exit before the maintainer reply lands.
 4a. If the envelope you received contains ``maintainer_dispatch`` (non-empty), that is the maintainer's answer to a PRIOR escalation on this PR. Execute against that dispatch as your primary instruction, cross-referenced against the current list of unresolved threads. The maintainer's dispatch supersedes any default handling heuristic.
 
 Step 0 (staleness check, MANDATORY before any other work):
@@ -1234,7 +1282,7 @@ INSTRUCTIONS
 1. Read pr-review-hygiene skill BEFORE touching the PR.
 2. Read the envelope JSON from the file path shown below this instruction block (use the ``read`` tool, then ``jq`` if you need to slice it). ``failed_job_logs`` has the tail of the red job.
 3. Emit ZERO intermediate assistant text. Every assistant message gets announced to the maintainer's Telegram, so narrations spam the chat. Do all reasoning silently via tool-use. Produce exactly ONE final text reply at the end.
-4. If you cannot fix the failure without a design call or if the failure is infra-level (not a code bug), write the question to the followup file at ``$HOME/.clawdbot/followups/${PR_KEY_SAFE}.json`` as JSON with two string fields — awaiting_input (a one-sentence question) and detail (a logs excerpt plus what you need). Then exit with the ⚠️ Telegram reply. Do NOT use sessions_send — the handler session exits before replies can land.
+4. If you cannot fix the failure without a design call or if the failure is infra-level (not a code bug), write the question to the followup file at ``$HOME/.clawdbot/followups/${PR_KEY_SAFE}.json`` as JSON with these string fields: awaiting_input (a one-sentence question), detail (a logs excerpt plus what you need), AND event + head_sha (copy from THIS envelope — event is the string ci_failed and head_sha comes from envelope.head_sha) so the maintainer's dispatch is only consumed by a handler firing on the same event+SHA. Then exit with the ⚠️ Telegram reply. Do NOT use sessions_send — the handler session exits before replies can land.
 4a. If the envelope contains ``maintainer_dispatch``, that is the maintainer's answer to a prior escalation on this PR. Execute against that dispatch as your primary instruction.
 
 Step 0 (staleness check, MANDATORY before any other work):
@@ -1329,21 +1377,44 @@ Rules: same as the review_comments branch. No SHA, no mergeStateStatus, no (head
             # thread length — a handler that only addresses outside-diff
             # findings would otherwise look like a no-op (threads
             # unchanged) and re-spawn every tick (gemini PR#39 _BZV2).
-            SPAWN_UNRESOLVED_COUNT=${TOTAL_COUNT:-0}
-            SPAWN_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-            jq --arg sha_key "$STATE_SHA_KEY" \
-               --argjson count "$SPAWN_UNRESOLVED_COUNT" \
-               --arg ts "$SPAWN_TS" \
-               '.handler_spawns[$sha_key] = {unresolved_count: $count, spawned_at: $ts}' \
-               "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+            # Persist handler_spawns only for ``review_comments``
+            # spawns (coderabbit PR#39 _BzXh). The silent-no-op
+            # detector reads this state to decide whether to bypass the
+            # renotify cooldown on the next tick — but it's ONLY
+            # consulted inside the HAS_COMMENTS path. A ``ci_failed``
+            # spawn on a SHA with zero review comments would otherwise
+            # write ``inline_unresolved_count: 0``, and the very next
+            # review_comments tick on the same SHA would satisfy
+            # ``UNRESOLVED >= 0`` and short-circuit the 15-min review
+            # wait window. Restricting the write to review_comments
+            # spawns keeps the state slot meaningful for its one
+            # consumer. Also record the inline count separately from
+            # the total so the detector can compare like-for-like.
+            if [ "$EVENT" = "review_comments" ]; then
+                SPAWN_INLINE_COUNT=${THREAD_COUNT:-0}
+                SPAWN_TOTAL_COUNT=${TOTAL_COUNT:-0}
+                SPAWN_OUTSIDE_COUNT=${OUTSIDE_DIFF_COUNT:-0}
+                SPAWN_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+                jq --arg sha_key "$STATE_SHA_KEY" \
+                   --argjson inline "$SPAWN_INLINE_COUNT" \
+                   --argjson outside "$SPAWN_OUTSIDE_COUNT" \
+                   --argjson total "$SPAWN_TOTAL_COUNT" \
+                   --arg ts "$SPAWN_TS" \
+                   '.handler_spawns[$sha_key] = {inline_unresolved_count: $inline, outside_diff_count: $outside, unresolved_count: $total, spawned_at: $ts}' \
+                   "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+            fi
             # Consume the followup file: the dispatch + escalation have
             # been folded into the envelope; a second spawn on a future
             # tick would re-deliver the same dispatch, causing duplicate
             # work. Delete only after confirmed successful spawn so a
             # failed spawn leaves the dispatch for the next tick retry.
+            # Only delete when the dispatch's stored event+head_sha
+            # match the spawn we just fired (coderabbit PR#39 _BzXb);
+            # HAS_DISPATCH is already gated on that match above, so
+            # a 1 here implies the stored scope aligned with this spawn.
             if [ "$HAS_DISPATCH" -eq 1 ] && [ -f "$FOLLOWUP_FILE" ]; then
                 rm -f "$FOLLOWUP_FILE"
-                echo "$LOG_PREFIX     🗑️  Consumed followup file for $PR_KEY (dispatch delivered)"
+                echo "$LOG_PREFIX     🗑️  Consumed followup file for $PR_KEY (dispatch delivered for event=$EVENT)"
             fi
             ;;
         2)

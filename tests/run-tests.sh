@@ -502,6 +502,125 @@ else
 fi
 echo ""
 
+# ─── Layer 5e: followup file event+head_sha scoping ─────────────────────
+#
+# The followup file at ~/.clawdbot/followups/<pr_key_safe>.json is the
+# dispatch channel between a handler escalation and the next handler
+# spawn. Dispatch consumption MUST be scoped to the event + head_sha the
+# escalation was written for, otherwise a dispatch answering a
+# review_comments escalation could be wrongly folded into the next
+# ci_failed spawn on the same PR (or vice versa), or consumed at a new
+# SHA after the premises have moved on. (coderabbit PR#39 _BzXb.)
+echo "Layer 5e: followup file scoping + pr-dispatch flags"
+
+PRM="$REPO_DIR/pr-manager.sh"
+PDISP="$REPO_DIR/pr-dispatch.sh"
+
+if grep -q 'FOLLOWUP_EVENT=$(echo "$FOLLOWUP_BLOB" | jq' "$PRM" \
+    && grep -q 'FOLLOWUP_HEAD_SHA=$(echo "$FOLLOWUP_BLOB" | jq' "$PRM"; then
+    pass "pr-manager reads .event and .head_sha from followup blob"
+else
+    fail "pr-manager missing .event / .head_sha reads from followup blob"
+fi
+if grep -q 'EVENT_OK=1' "$PRM" && grep -q 'SHA_OK=1' "$PRM"; then
+    pass "pr-manager gates HAS_DISPATCH on EVENT_OK + SHA_OK"
+else
+    fail "pr-manager missing HAS_DISPATCH gating on EVENT_OK+SHA_OK"
+fi
+
+if grep -q -- '--event)' "$PDISP" && grep -q -- '--head-sha)' "$PDISP"; then
+    pass "pr-dispatch.sh accepts --event and --head-sha flags"
+else
+    fail "pr-dispatch.sh missing --event / --head-sha flag parsing"
+fi
+if grep -q 'event_override' "$PDISP" && grep -q 'head_sha_override' "$PDISP"; then
+    pass "pr-dispatch.sh preserves or overrides event/head_sha in payload"
+else
+    fail "pr-dispatch.sh not persisting event/head_sha"
+fi
+
+# Live round-trip through pr-dispatch.sh using an isolated $HOME.
+TMP_FUP_DIR=$(mktemp -d)
+_fup_cleanup() { rm -rf "$TMP_FUP_DIR"; }
+trap _fup_cleanup EXIT
+HOME_SAVE="$HOME"
+export HOME="$TMP_FUP_DIR"
+mkdir -p "$HOME/.clawdbot/followups"
+cat > "$HOME/.clawdbot/followups/o-r-42.json" <<'EOF'
+{"pr_key":"o/r#42","awaiting_input":"what lang?","event":"review_comments","head_sha":"abc1234","detail":"x","threads":[]}
+EOF
+
+if "$PDISP" "o/r#42" "use English" >/dev/null 2>&1; then
+    RESULT=$(cat "$HOME/.clawdbot/followups/o-r-42.json")
+    if [ "$(echo "$RESULT" | jq -r .event)" = "review_comments" ] \
+        && [ "$(echo "$RESULT" | jq -r .head_sha)" = "abc1234" ] \
+        && [ "$(echo "$RESULT" | jq -r .dispatch)" = "use English" ]; then
+        pass "pr-dispatch.sh preserves prior event+head_sha when not overridden"
+    else
+        fail "pr-dispatch.sh lost prior event/head_sha: $RESULT"
+    fi
+else
+    fail "pr-dispatch.sh failed to write dispatch"
+fi
+
+if "$PDISP" "o/r#42" "retry with ruff" --event ci_failed --head-sha deadbeef0 >/dev/null 2>&1; then
+    RESULT=$(cat "$HOME/.clawdbot/followups/o-r-42.json")
+    if [ "$(echo "$RESULT" | jq -r .event)" = "ci_failed" ] \
+        && [ "$(echo "$RESULT" | jq -r .head_sha)" = "deadbeef0" ]; then
+        pass "pr-dispatch.sh --event / --head-sha override flags take effect"
+    else
+        fail "pr-dispatch.sh override flags ignored: $RESULT"
+    fi
+else
+    fail "pr-dispatch.sh failed with override flags"
+fi
+
+if "$PDISP" "o/r#42" "nope" --event bogus_event >/dev/null 2>&1; then
+    fail "pr-dispatch.sh accepted invalid --event value"
+else
+    pass "pr-dispatch.sh rejects invalid --event value"
+fi
+if "$PDISP" "o/r#42" "nope" --head-sha not-hex >/dev/null 2>&1; then
+    fail "pr-dispatch.sh accepted non-hex --head-sha"
+else
+    pass "pr-dispatch.sh rejects non-hex --head-sha"
+fi
+
+export HOME="$HOME_SAVE"
+trap - EXIT
+_fup_cleanup
+echo ""
+
+# ─── Layer 5g: handler_spawns state is scoped to review_comments ─────────
+echo "Layer 5g: handler_spawns is review_comments-only + inline-count"
+#
+# The handler_spawns state slot feeds the silent-no-op detector, which
+# lives inside the HAS_COMMENTS path. A ci_failed spawn that wrote
+# {unresolved_count: 0} here would cause the next review_comments tick
+# on the same SHA to satisfy UNRESOLVED >= 0 and short-circuit the
+# 15-min review-wait window. Guard the write on EVENT==review_comments.
+# Additionally, we now persist inline_unresolved_count separately from
+# the total, so the detector compares like-for-like
+# (coderabbit PR#39 _BzXV / _BzXh).
+handler_block=$(awk '/Record this spawn.s pre-run finding count/,/Consume the followup file/' "$PRM")
+if echo "$handler_block" | grep -q 'EVENT. = "review_comments"'; then
+    pass "handler_spawns write gated on EVENT==review_comments"
+else
+    fail "handler_spawns write still unconditionally runs for ci_failed spawns"
+fi
+if echo "$handler_block" | grep -q 'inline_unresolved_count' \
+    && echo "$handler_block" | grep -q 'outside_diff_count'; then
+    pass "handler_spawns records inline_unresolved_count + outside_diff_count"
+else
+    fail "handler_spawns missing inline / outside split fields"
+fi
+if grep -q 'PRIOR_INLINE=.*inline_unresolved_count' "$PRM"; then
+    pass "silent-no-op detector reads inline_unresolved_count"
+else
+    fail "silent-no-op detector not reading inline_unresolved_count"
+fi
+echo ""
+
 # ─── Layer 6: No hardcoded PII ────────────────────────────────────────────
 echo "Layer 6: PII audit"
 

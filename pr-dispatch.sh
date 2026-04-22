@@ -19,11 +19,23 @@
 # bypasses the review-wait + renotification cooldown so it happens fast).
 #
 # Usage:
-#   pr-dispatch.sh <pr_key> <plan_text_or_- >
+#   pr-dispatch.sh <pr_key> <plan_text_or_- > [--event <event>] [--head-sha <sha>]
 #
 # Arguments:
 #   pr_key      e.g. ``owner/repo#325``
 #   plan        the dispatch text. If ``-`` read from stdin.
+#
+# Optional flags:
+#   --event <review_comments|ci_failed>
+#       Scope this dispatch to a specific event type. pr-manager will
+#       only fold it into a fresh handler envelope whose event matches.
+#       If omitted, any prior event already recorded in the followup
+#       file (e.g. by the handler that escalated) is preserved.
+#   --head-sha <sha>
+#       Scope this dispatch to a specific PR head SHA. Same rationale:
+#       a dispatch answering a question about the code at SHA X should
+#       not be consumed by a spawn on SHA Y where new commits have
+#       moved the premises on. Preserves any prior value if omitted.
 #
 # The pr_key is converted to a safe filename the same way pr-manager.sh
 # does: ``tr '/#' '--'``. This keeps both sides in lockstep without an
@@ -35,21 +47,67 @@ FOLLOWUPS_DIR="$HOME/.clawdbot/followups"
 mkdir -p "$FOLLOWUPS_DIR"
 
 if [ $# -lt 2 ]; then
-    echo "usage: $0 <pr_key> <plan | ->" >&2
+    echo "usage: $0 <pr_key> <plan | -> [--event <event>] [--head-sha <sha>]" >&2
     echo "  pr_key examples: owner/repo#325, owner/other-repo#259" >&2
     exit 2
 fi
 
 PR_KEY="$1"
-# Collect all arguments from position 2 onward so unquoted multi-word
-# plans (e.g. ``pr-dispatch.sh owner/repo#1 fix the flaky test``) are
-# preserved instead of silently truncated to just ``$2``.
-PLAN_ARG="${*:2}"
+shift
+
+# Parse optional flags out of the remaining argv. Everything that
+# isn't a known flag is treated as part of the plan text (so unquoted
+# multi-word plans still work). The first positional chunk is the
+# plan; flags may appear in any order after it.
+DISPATCH_EVENT=""
+DISPATCH_HEAD_SHA=""
+PLAN_PARTS=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --event)
+            if [ $# -lt 2 ]; then
+                echo "error: --event requires a value" >&2
+                exit 7
+            fi
+            DISPATCH_EVENT="$2"
+            shift 2
+            ;;
+        --head-sha)
+            if [ $# -lt 2 ]; then
+                echo "error: --head-sha requires a value" >&2
+                exit 7
+            fi
+            DISPATCH_HEAD_SHA="$2"
+            shift 2
+            ;;
+        *)
+            PLAN_PARTS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+if [ ${#PLAN_PARTS[@]} -eq 0 ]; then
+    echo "error: missing plan text (use '-' for stdin)" >&2
+    exit 2
+fi
+PLAN_ARG="${PLAN_PARTS[*]}"
 
 if [ "$PLAN_ARG" = "-" ]; then
     PLAN_TEXT=$(cat)
 else
     PLAN_TEXT="$PLAN_ARG"
+fi
+
+# Shape-check the optional scope fields so a malformed --event or
+# --head-sha surfaces before we rewrite the followup file.
+if [ -n "$DISPATCH_EVENT" ] && [[ ! "$DISPATCH_EVENT" =~ ^(review_comments|ci_failed)$ ]]; then
+    echo "error: --event must be review_comments or ci_failed, got: $DISPATCH_EVENT" >&2
+    exit 7
+fi
+if [ -n "$DISPATCH_HEAD_SHA" ] && [[ ! "$DISPATCH_HEAD_SHA" =~ ^[a-f0-9]{7,40}$ ]]; then
+    echo "error: --head-sha must be 7-40 char hex, got: $DISPATCH_HEAD_SHA" >&2
+    exit 7
 fi
 
 if [ -z "$PLAN_TEXT" ]; then
@@ -96,11 +154,20 @@ fi
 
 # Feed the prior payload via stdin to dodge argv size limits (E2BIG)
 # if the followup ever grows large (multi-handler escalation history).
+#
+# Event + head_sha are preserved in the followup payload so pr-manager
+# can scope dispatch consumption to the originating event/SHA. If the
+# handler already recorded them when it escalated, we don't clobber
+# them unless the caller passed --event / --head-sha explicitly.
 printf '%s' "$EXISTING" | jq \
     --arg dispatch "$PLAN_TEXT" \
     --arg dispatched_at "$NOW_ISO" \
     --arg pr_key "$PR_KEY" \
-    '. + {pr_key: $pr_key, dispatch: $dispatch, dispatched_at: $dispatched_at}' \
+    --arg event_override "$DISPATCH_EVENT" \
+    --arg head_sha_override "$DISPATCH_HEAD_SHA" \
+    '. + {pr_key: $pr_key, dispatch: $dispatch, dispatched_at: $dispatched_at}
+     + (if ($event_override | length) > 0 then {event: $event_override} else {} end)
+     + (if ($head_sha_override | length) > 0 then {head_sha: $head_sha_override} else {} end)' \
     > "$FOLLOWUP_FILE.tmp"
 
 mv "$FOLLOWUP_FILE.tmp" "$FOLLOWUP_FILE"
