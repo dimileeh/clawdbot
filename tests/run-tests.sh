@@ -425,6 +425,17 @@ echo ""
 # test-command detection moved out of pr-manager into the handler skill
 # itself), so its tests no longer have anything to source. Dropped rather
 # than ported because the function they covered no longer exists.
+#
+# Known tech debt (coderabbit PR#39 outside-diff 423-427): the handler
+# skill (~/.clawdbot/skills/pr-review-hygiene/SKILL.md) now owns the
+# test-command detection logic, but that logic is prose/instructions
+# rather than a bash function — it runs inside the LLM handler session,
+# not as a shellable helper. There is no clean unit-test seam for LLM
+# prompt behaviour in this repo's test harness. Covered in practice by
+# integration: every handler spawn exercises the skill and the output
+# is visible on the PR it processes. If this becomes a real regression
+# source, the next step is mocking the handler harness in a separate
+# fixture rather than re-adding tests that have no function to call.
 
 # ─── Layer 5d: CI log redaction ──────────────────────────────────
 echo "Layer 5d: CI log redaction"

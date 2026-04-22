@@ -494,8 +494,21 @@ for REPO in $REPOS; do
 
             # Pre-compute sha256 of each review body so downstream filters
             # can compare (review_id, body_hash) against ack-comment
-            # markers. jq has no sha256; we do it in bash with sha256sum
-            # and inject the hash back into each review node.
+            # markers. jq has no sha256; we do it in bash with shasum and
+            # inject the hash back into each review node.
+            #
+            # Portability note (gemini PR#39 _BZVf): prefer ``shasum -a
+            # 256`` over GNU ``sha256sum`` so this script also works on
+            # macOS (where shasum ships as a Perl script in the base
+            # install and sha256sum is only available via coreutils).
+            # Output format is identical: ``<hex>  -``.
+            #
+            # Robustness (coderabbit PR#39 outside-diff 494-513): the
+            # inner loop runs in a subshell because of the upstream pipe
+            # from ``jq -c '.reviews.nodes[]'``. If per-iteration hash
+            # computation fails (malformed node, shasum missing), guard
+            # with ``|| continue`` so one bad node doesn't silently drop
+            # the rest of the array out of the final slurp.
             PR=$(echo "$PR" | jq -c '
                 .reviews.nodes as $rs
                 | .reviews.nodes = [ $rs[] | . + {body_hash_placeholder: true} ]
@@ -505,8 +518,8 @@ for REPO in $REPOS; do
             if [ "$REVIEW_COUNT" -gt 0 ]; then
                 TMP_REVIEWS=$(mktemp)
                 echo "$PR" | jq -c '.reviews.nodes[]' | while IFS= read -r REVIEW_NODE; do
-                    BODY_HASH=$(echo "$REVIEW_NODE" | jq -r '.body // ""' | sha256sum | awk '{print $1}')
-                    echo "$REVIEW_NODE" | jq --arg hash "$BODY_HASH" 'del(.body_hash_placeholder) | . + {body_hash: $hash}'
+                    BODY_HASH=$(echo "$REVIEW_NODE" | jq -r '.body // ""' | shasum -a 256 | awk '{print $1}') || continue
+                    echo "$REVIEW_NODE" | jq --arg hash "$BODY_HASH" 'del(.body_hash_placeholder) | . + {body_hash: $hash}' || continue
                 done | jq -sc '.' > "$TMP_REVIEWS"
                 PR=$(echo "$PR" | jq --slurpfile hashed_reviews "$TMP_REVIEWS" '.reviews.nodes = $hashed_reviews[0]')
                 rm -f "$TMP_REVIEWS"
@@ -520,10 +533,15 @@ for REPO in $REPOS; do
             # (different hash) re-surfaces even if the review_id was
             # previously acked. A NEW coderabbit review with the same
             # findings would get a new review_id anyway.
+            # Hash is exactly 64 hex chars (sha256); SHA is 7-40 hex
+            # chars (git commit SHA, supports both short and full). Strict
+            # character classes prevent accidental matches if someone
+            # ever comments with similar-looking text that isn't actually
+            # an ack marker (gemini PR#39 _BZVu).
             PR_ACK_MARKERS=$(echo "$PR" | jq -c '
                 [ (.comments.nodes // [])[]
                   | .body as $b
-                  | ($b | scan("<!-- clawdbot:outside-diff-addressed review=([0-9]+) hash=([a-f0-9]+) sha=([a-f0-9]+) -->"; "g"))
+                  | ($b | scan("<!-- clawdbot:outside-diff-addressed review=([0-9]+) hash=([a-f0-9]{64}) sha=([a-f0-9]{7,40}) -->"; "g"))
                   | {review_id: .[0], body_hash: .[1], sha: .[2]}
                 ]
             ')
@@ -692,8 +710,14 @@ for REPO in $REPOS; do
                     # delivered when the handler first escalated;
                     # repeating it adds noise, not signal.
                     if [ -f "$PR_FOLLOWUP_FILE" ]; then
-                        PR_FOLLOWUP_AWAITING=$(jq -r '.awaiting_input // ""' "$PR_FOLLOWUP_FILE" 2>/dev/null)
-                        PR_FOLLOWUP_DISPATCH=$(jq -r '.dispatch // ""' "$PR_FOLLOWUP_FILE" 2>/dev/null)
+                        # Single jq invocation reads both fields (gemini
+                        # PR#39 _BZVx). Newline-separated output, two
+                        # ordered reads — awaiting_input first, dispatch
+                        # second. Stays correct because pr-dispatch.sh
+                        # validates both as single-line strings on write.
+                        PR_FOLLOWUP_AWAITING=""
+                        PR_FOLLOWUP_DISPATCH=""
+                        { read -r PR_FOLLOWUP_AWAITING || true; read -r PR_FOLLOWUP_DISPATCH || true; } < <(jq -r '.awaiting_input // "", .dispatch // ""' "$PR_FOLLOWUP_FILE" 2>/dev/null)
                         if [ -n "$PR_FOLLOWUP_AWAITING" ] && [ -z "$PR_FOLLOWUP_DISPATCH" ]; then
                             echo "$LOG_PREFIX     ⏸️  Escalation pending on $PR_KEY (awaiting maintainer dispatch); skipping spawn"
                             continue
@@ -1298,10 +1322,14 @@ Rules: same as the review_comments branch. No SHA, no mergeStateStatus, no (head
                 jq --arg state_key "$STATE_KEY" --arg sha_key "$STATE_SHA_KEY" --arg ts "$STATE_TS" \
                     '.[$state_key][$sha_key] = $ts' "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
             fi
-            # Record this spawn's pre-run unresolved count so the next
+            # Record this spawn's pre-run finding count so the next
             # tick on the same SHA can detect a silent no-op (prior
-            # handler completed with zero progress).
-            SPAWN_UNRESOLVED_COUNT=$(echo "$BLOB" | jq '.unresolved_threads | length // 0')
+            # handler completed with zero progress). Use TOTAL_COUNT
+            # (inline threads + outside-diff reviews) not just inline
+            # thread length — a handler that only addresses outside-diff
+            # findings would otherwise look like a no-op (threads
+            # unchanged) and re-spawn every tick (gemini PR#39 _BZV2).
+            SPAWN_UNRESOLVED_COUNT=${TOTAL_COUNT:-0}
             SPAWN_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
             jq --arg sha_key "$STATE_SHA_KEY" \
                --argjson count "$SPAWN_UNRESOLVED_COUNT" \
