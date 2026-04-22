@@ -19,9 +19,9 @@
 #
 # Arguments:
 #   pr_key       e.g. dimileeh/aira-agent#325
-#   review_id    the numeric review id (from envelope's outside_diff_reviews[].review_id;
-#                strip the GraphQL node prefix if present, e.g. "PRR_..." leave as-is
-#                since the ack marker is text-matched anyway)
+#   review_id    numeric review id from envelope.outside_diff_reviews[].review_id
+#                (must match pr-manager marker parser contract: review=([0-9]+);
+#                strip any GraphQL node prefix like "PRR_..." before calling)
 #   body_hash    sha256 hex digest of the review body (from envelope's
 #                outside_diff_reviews[].body_hash)
 #   commit_sha   the commit SHA that addresses the findings (40-char hex or short)
@@ -51,7 +51,7 @@ PR_KEY="$1"
 REVIEW_ID="$2"
 BODY_HASH="$3"
 COMMIT_SHA="$4"
-SUMMARY="$5"
+SUMMARY="${*:5}"
 
 # Shape checks
 if ! [[ "$PR_KEY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+$ ]]; then
