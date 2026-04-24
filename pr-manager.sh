@@ -48,6 +48,34 @@ export PATH="${CLAWDBOT_NODE_PATH:-$HOME/.nvm/versions/node/v24.13.0/bin}:/home/
 
 REPOS="${CLAWDBOT_REPOS:?Set CLAWDBOT_REPOS in .env}"
 STATE_FILE="$HOME/.clawdbot/pr-manager-state.json"
+
+# Maintainer-dispatch / escalation followup directory.
+#
+# Problem this solves (observed 2026-04-21 on PRs #325 + #259): when a
+# handler needs a product/design call, it used to send an [ESCALATION]
+# message via ``sessions_send`` to the main Sparky session and exit
+# succeeded. Two failure modes made that channel unreliable:
+#
+#   1. Handler exits immediately after the escalation call. Sparky's
+#      response via ``sessions_send`` lands on a session that's already
+#      been torn down. The reply evaporates silently (no queue, no
+#      retry, no error to the caller) and the handler never gets it.
+#
+#   2. Even if Sparky's reply landed while the handler was still alive,
+#      the handler's prompt contract says "escalate AND exit", so the
+#      dispatch arrives after the session is gone regardless.
+#
+# File-based followups fix both: handlers persist their escalation to
+# a stable path keyed by PR. Sparky writes the dispatch to the same
+# file. The next pr-manager tick folds the dispatch into the envelope
+# for a fresh handler spawn — the new handler gets Sparky's decisions
+# in its initial context instead of via a dead IPC channel.
+#
+# Files are one-shot: pr-manager consumes (reads + deletes) the file
+# when it folds the dispatch into a spawn, so stale dispatches cannot
+# re-trigger handlers on unrelated future SHAs.
+FOLLOWUPS_DIR="$HOME/.clawdbot/followups"
+mkdir -p "$FOLLOWUPS_DIR" 2>/dev/null || true
 LOG_PREFIX="[pr-manager $(date -u +%H:%M:%S)]"
 
 # Branch names are configurable so teams using different conventions (e.g.
@@ -103,7 +131,7 @@ _iso_minutes_ago() {
 [ -f "$STATE_FILE" ] || echo '{}' > "$STATE_FILE"
 # Ensure top-level keys. notified_reviews / notified_ci are keyed by
 # "<repo>#<num>@<sha>" so a new commit cleanly resets them.
-for KEY in notified_main_prs merged_prs created_dev_main_prs first_seen_unresolved notified_reviews notified_ci; do
+for KEY in notified_main_prs merged_prs created_dev_main_prs first_seen_unresolved notified_reviews notified_ci handler_spawns; do
     if ! jq -e ".$KEY" "$STATE_FILE" >/dev/null 2>&1; then
         jq ". + {\"$KEY\":{}}" "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
     fi
@@ -387,6 +415,43 @@ for REPO in $REPOS; do
                 }
               }
             }
+            # Outside-diff review body comments. CodeRabbit + Greptile
+            # frequently post findings in the review BODY rather than
+            # as inline reviewThreads when the file/line isn't in the
+            # PR diff (e.g. files unchanged by the PR but affected by
+            # it — cache invalidation helpers, webhook replay scope,
+            # test file unique-key tightening). These comments are NOT
+            # in ``reviewThreads.nodes`` and were invisible to handlers
+            # until today. CodeRabbit's review body also carries a
+            # structured ``Prompt for all review comments with AI
+            # agents`` section at the bottom that's literally
+            # machine-readable instructions — we ship the full body
+            # through and let the handler extract.
+            reviews(first: 30) {
+              nodes {
+                id
+                databaseId
+                state
+                author { login }
+                submittedAt
+                body
+              }
+            }
+            # Outside-diff acknowledgement comments. The handler posts a
+            # PR-level issue comment like:
+            #   <!-- clawdbot:outside-diff-addressed review=<id> hash=<sha256> sha=<commit_sha> -->
+            # when it lands a commit that addresses outside-diff findings
+            # from a given review. Next pr-manager tick reads these
+            # markers and suppresses the matching review from the
+            # handler envelope. See pr-ack-outside-diff.sh.
+            comments(first: 50) {
+              nodes {
+                id
+                body
+                author { login }
+                createdAt
+              }
+            }
             commits(last: 1) {
               nodes {
                 commit {
@@ -426,6 +491,60 @@ for REPO in $REPOS; do
             PR_NUM=$(echo "$PR" | jq -r '.number')
             PR_TITLE=$(echo "$PR" | jq -r '.title')
             PR_BASE=$(echo "$PR" | jq -r '.baseRefName')
+
+            # Pre-compute sha256 of each review body so downstream filters
+            # can compare (review_id, body_hash) against ack-comment
+            # markers. jq has no sha256; we do it in bash with shasum and
+            # inject the hash back into each review node.
+            #
+            # Portability note (gemini PR#39 _BZVf): prefer ``shasum -a
+            # 256`` over GNU ``sha256sum`` so this script also works on
+            # macOS (where shasum ships as a Perl script in the base
+            # install and sha256sum is only available via coreutils).
+            # Output format is identical: ``<hex>  -``.
+            #
+            # Robustness (coderabbit PR#39 outside-diff 494-513): the
+            # inner loop runs in a subshell because of the upstream pipe
+            # from ``jq -c '.reviews.nodes[]'``. If per-iteration hash
+            # computation fails (malformed node, shasum missing), guard
+            # with ``|| continue`` so one bad node doesn't silently drop
+            # the rest of the array out of the final slurp.
+            PR=$(echo "$PR" | jq -c '
+                .reviews.nodes as $rs
+                | .reviews.nodes = [ $rs[] | . + {body_hash_placeholder: true} ]
+            ')
+            # Walk the reviews array and compute hashes
+            REVIEW_COUNT=$(echo "$PR" | jq '.reviews.nodes | length')
+            if [ "$REVIEW_COUNT" -gt 0 ]; then
+                TMP_REVIEWS=$(mktemp)
+                echo "$PR" | jq -c '.reviews.nodes[]' | while IFS= read -r REVIEW_NODE; do
+                    BODY_HASH=$(echo "$REVIEW_NODE" | jq -r '.body // ""' | shasum -a 256 | awk '{print $1}') || continue
+                    echo "$REVIEW_NODE" | jq --arg hash "$BODY_HASH" 'del(.body_hash_placeholder) | . + {body_hash: $hash}' || continue
+                done | jq -sc '.' > "$TMP_REVIEWS"
+                PR=$(echo "$PR" | jq --slurpfile hashed_reviews "$TMP_REVIEWS" '.reviews.nodes = $hashed_reviews[0]')
+                rm -f "$TMP_REVIEWS"
+            fi
+
+            # Extract outside-diff ack markers from PR issue comments.
+            # Handler posts these via pr-ack-outside-diff.sh when it
+            # addresses an outside-diff review's findings. Format:
+            #   <!-- clawdbot:outside-diff-addressed review=<id> hash=<sha256> sha=<commit_sha> -->
+            # We pair (review_id, body_hash) so an edited review body
+            # (different hash) re-surfaces even if the review_id was
+            # previously acked. A NEW coderabbit review with the same
+            # findings would get a new review_id anyway.
+            # Hash is exactly 64 hex chars (sha256); SHA is 7-40 hex
+            # chars (git commit SHA, supports both short and full). Strict
+            # character classes prevent accidental matches if someone
+            # ever comments with similar-looking text that isn't actually
+            # an ack marker (gemini PR#39 _BZVu).
+            PR_ACK_MARKERS=$(echo "$PR" | jq -c '
+                [ (.comments.nodes // [])[]
+                  | .body as $b
+                  | ($b | scan("<!-- clawdbot:outside-diff-addressed review=([0-9]+) hash=([a-f0-9]{64}) sha=([a-f0-9]{7,40}) -->"; "g"))
+                  | {review_id: .[0], body_hash: .[1], sha: .[2]}
+                ]
+            ')
             PR_HEAD=$(echo "$PR" | jq -r '.headRefName')
             PR_URL=$(echo "$PR" | jq -r '.url')
             IS_DRAFT=$(echo "$PR" | jq -r '.isDraft')
@@ -498,12 +617,35 @@ for REPO in $REPOS; do
                         continue
                     fi
                     echo "$LOG_PREFIX     ✅ Auto-merging PR #$PR_NUM to development..."
-                    if gh pr merge "$PR_NUM" --repo "$REPO" --squash --delete-branch 2>&1; then
+                    MERGE_OUT=$(gh pr merge "$PR_NUM" --repo "$REPO" --squash --delete-branch 2>&1) && MERGE_RC=0 || MERGE_RC=$?
+                    if [ "$MERGE_RC" -eq 0 ]; then
                         MERGE_REASONS="${MERGE_REASONS}✅ Auto-merged $PR_KEY to development: $PR_TITLE\n   $PR_URL\n"
                         jq --arg key "$PR_KEY" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
                             '.merged_prs[$key] = $ts' "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+                    elif echo "$MERGE_OUT" | grep -qi 'head branch is not up to date'; then
+                        # PR branch fell behind base while waiting for CI /
+                        # while another PR merged. Branch protection
+                        # ``required_status_checks.strict: true`` demands
+                        # rebase onto base before merge. The "Update
+                        # branch" button in the GitHub UI does exactly
+                        # that; ``gh pr update-branch`` hits the same API
+                        # (PUT /repos/{owner}/{repo}/pulls/{n}/update-branch).
+                        # The update creates a merge commit on the head
+                        # branch, triggering CI to re-run. Next pr-manager
+                        # tick finds the PR with fresh SHA + CI pending;
+                        # once CI goes green the auto-merge attempt
+                        # succeeds on its own. We ask GitHub to perform
+                        # the update; we do NOT wait for CI here — the
+                        # next tick handles the follow-through.
+                        UPDATE_OUT=$(gh pr update-branch "$PR_NUM" --repo "$REPO" 2>&1) && UPDATE_RC=0 || UPDATE_RC=$?
+                        if [ "$UPDATE_RC" -eq 0 ]; then
+                            echo "$LOG_PREFIX     🔄 Auto-rebased $PR_KEY onto $PR_BASE — CI re-running, will retry merge on next tick"
+                        else
+                            echo "$LOG_PREFIX     ⚠️ Auto-rebase FAILED for $PR_KEY: $UPDATE_OUT" >&2
+                            MERGE_REASONS="${MERGE_REASONS}⚠️ Auto-rebase FAILED for $PR_KEY (head branch behind base, update-branch errored): $PR_TITLE\n   $PR_URL\n"
+                        fi
                     else
-                        echo "$LOG_PREFIX     ⚠️ Merge failed"
+                        echo "$LOG_PREFIX     ⚠️ Merge failed: $MERGE_OUT"
                         MERGE_REASONS="${MERGE_REASONS}⚠️ Auto-merge FAILED for $PR_KEY: $PR_TITLE\n   $PR_URL\n"
                     fi
                     ;;
@@ -532,63 +674,244 @@ for REPO in $REPOS; do
                     NOW_ISO=$(date -u +%Y-%m-%dT%H:%M:%SZ)
                     FIRST_SEEN=$(jq -r ".first_seen_unresolved[\"$SHA_KEY\"] // \"\"" "$STATE_FILE")
                     LAST_NOTIFIED=$(jq -r ".notified_reviews[\"$SHA_KEY\"] // \"\"" "$STATE_FILE")
+
+                    # Maintainer-dispatch bypass. If a dispatch file exists
+                    # for this PR, the maintainer (Sparky) has answered a
+                    # prior handler escalation. A fresh handler must run
+                    # immediately to consume that dispatch — skip BOTH the
+                    # 15-minute review-wait window AND the 60-minute
+                    # renotification cooldown. Without this bypass, handler
+                    # escalations would stall for up to 75 minutes before
+                    # the dispatch gets picked up, defeating the purpose
+                    # of the file-based followup channel.
+                    BYPASS_COOLDOWN=0
+                    BYPASS_REASON=""
+                    PR_FOLLOWUP_FILE="$FOLLOWUPS_DIR/$(echo "$PR_KEY" | tr '/#' '--').json"
+
+                    # Pending-escalation gate (2026-04-22 incident).
+                    # Overnight on one PR, the handler escalated
+                    # (awaiting_input set, dispatch empty), exited
+                    # ``succeeded``, and the silent-no-op detector
+                    # treated the unchanged unresolved count as a
+                    # failure signal — which triggered another spawn
+                    # every 5 minutes for 9+ hours (35+ handler runs,
+                    # 35+ identical Telegram re-pings) while the
+                    # maintainer was away.
+                    #
+                    # Fix: if the followup file has awaiting_input AND
+                    # no dispatch, the question is pending on the
+                    # maintainer. Spawning another handler would just
+                    # re-read the same envelope, re-write the same
+                    # escalation, and re-ping the same Telegram line.
+                    # SKIP this PR entirely this tick. Log it so the
+                    # operator can see the state, but DO NOT spawn a
+                    # handler and DO NOT send any Telegram notification.
+                    # The original escalation Telegram line was already
+                    # delivered when the handler first escalated;
+                    # repeating it adds noise, not signal.
+                    if [ -f "$PR_FOLLOWUP_FILE" ]; then
+                        # Single jq invocation reads both fields (gemini
+                        # PR#39 _BZVx). Newline-separated output, two
+                        # ordered reads — awaiting_input first, dispatch
+                        # second. Stays correct because pr-dispatch.sh
+                        # validates both as single-line strings on write.
+                        PR_FOLLOWUP_AWAITING=""
+                        PR_FOLLOWUP_DISPATCH=""
+                        { read -r PR_FOLLOWUP_AWAITING || true; read -r PR_FOLLOWUP_DISPATCH || true; } < <(jq -r '.awaiting_input // "", .dispatch // ""' "$PR_FOLLOWUP_FILE" 2>/dev/null)
+                        if [ -n "$PR_FOLLOWUP_AWAITING" ] && [ -z "$PR_FOLLOWUP_DISPATCH" ]; then
+                            echo "$LOG_PREFIX     ⏸️  Escalation pending on $PR_KEY (awaiting maintainer dispatch); skipping spawn"
+                            continue
+                        fi
+                        if [ -n "$PR_FOLLOWUP_DISPATCH" ] && [ "$PR_FOLLOWUP_DISPATCH" != '""' ]; then
+                            BYPASS_COOLDOWN=1
+                            BYPASS_REASON="maintainer-dispatch"
+                            echo "$LOG_PREFIX     📩 Maintainer dispatch present for $PR_KEY; bypassing wait and cooldown"
+                        fi
+                    fi
+
+                    # Silent-no-op detector. If the PRIOR handler spawn on
+                    # this same SHA recorded N unresolved threads and the
+                    # PR still has >= N unresolved threads now with no
+                    # commits advancing the SHA (SHA would have changed
+                    # otherwise, so the SHA match already implies no new
+                    # commits), the handler ran, said 'succeeded', and did
+                    # nothing. This happened twice on 2026-04-21 on PRs
+                    # #325 + #259 and left the cooldown ticking for 60
+                    # minutes with zero progress. Detect and force a fresh
+                    # spawn, bypassing the cooldown but NOT the 15-min
+                    # review-wait window (a fresh wait on a silent no-op
+                    # would just repeat the failure). We also require
+                    # BYPASS_COOLDOWN stays 0 if the dispatch already set
+                    # it — dispatch-driven spawns supersede no-op detection.
+                    # The pending-escalation gate above has already
+                    # ``continue``d for awaiting_input states, so by the
+                    # time we get here there's no pending question.
+                    if [ "$BYPASS_COOLDOWN" -eq 0 ]; then
+                        PRIOR_SPAWN=$(jq -r ".handler_spawns[\"$SHA_KEY\"] // empty" "$STATE_FILE")
+                        if [ -n "$PRIOR_SPAWN" ]; then
+                            # Compare like-for-like: inline-only vs
+                            # inline-only. The older schema stored the
+                            # TOTAL (inline + outside-diff) in
+                            # unresolved_count, which made UNRESOLVED
+                            # (inline only) always fall short of the
+                            # total and masked genuine no-ops when the
+                            # prior spawn had outside-diff findings.
+                            # We now persist an explicit
+                            # inline_unresolved_count field (coderabbit
+                            # PR#39 _BzXV); fall back to the legacy
+                            # unresolved_count for state files written
+                            # before this change, with the caveat that
+                            # older entries may report the inflated total.
+                            # The legacy fallback can over-detect
+                            # silent-no-ops on state written by the old
+                            # schema — benign: an extra spawn at worst.
+                            PRIOR_INLINE=$(echo "$PRIOR_SPAWN" | jq -r '.inline_unresolved_count // .unresolved_count // -1')
+                            if [ "$PRIOR_INLINE" != "-1" ] && [ "$UNRESOLVED" -ge "$PRIOR_INLINE" ]; then
+                                BYPASS_COOLDOWN=1
+                                BYPASS_REASON="silent-no-op-retry"
+                                echo "$LOG_PREFIX     🔁 Prior handler on $SHA_KEY was a no-op (inline unresolved was $PRIOR_INLINE, still $UNRESOLVED); bypassing cooldown for retry"
+                            fi
+                        fi
+                    fi
+
                     if [ -z "$FIRST_SEEN" ]; then
                         jq --arg key "$SHA_KEY" --arg ts "$NOW_ISO" \
                             '.first_seen_unresolved[$key] = $ts' "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
-                        echo "$LOG_PREFIX     ⏱️ First observation at this SHA — starting ${REVIEW_WAIT_MINUTES}m review wait window"
-                        continue
-                    fi
-
-                    WAIT_CUTOFF=$(_iso_minutes_ago "$REVIEW_WAIT_MINUTES")
-                    if [ -z "$WAIT_CUTOFF" ]; then
-                        echo "$LOG_PREFIX     ⚠️ review-wait cutoff computation failed; skipping this PR this tick (no notification, will retry next tick)" >&2
-                        continue
-                    fi
-                    if [[ "$FIRST_SEEN" > "$WAIT_CUTOFF" ]]; then
-                        echo "$LOG_PREFIX     ⏳ Still inside ${REVIEW_WAIT_MINUTES}m review wait window (since $FIRST_SEEN)"
-                        continue
-                    fi
-
-                    if [ -n "$LAST_NOTIFIED" ]; then
-                        RENOTIFY_CUTOFF=$(_iso_minutes_ago "$RENOTIFY_MINUTES")
-                        if [ -z "$RENOTIFY_CUTOFF" ]; then
-                            echo "$LOG_PREFIX     ⚠️ renotify cutoff computation failed; skipping re-notification this tick" >&2
+                        if [ "$BYPASS_COOLDOWN" -eq 1 ]; then
+                            echo "$LOG_PREFIX     ⏩ First observation at this SHA but bypass active (${BYPASS_REASON:-unknown}) — proceeding immediately"
+                        else
+                            echo "$LOG_PREFIX     ⏱️ First observation at this SHA — starting ${REVIEW_WAIT_MINUTES}m review wait window"
                             continue
                         fi
-                        if [[ "$LAST_NOTIFIED" > "$RENOTIFY_CUTOFF" ]]; then
-                            echo "$LOG_PREFIX     🔕 Already notified at this SHA (since $LAST_NOTIFIED), within ${RENOTIFY_MINUTES}m renotification cooldown"
+                    fi
+
+                    if [ "$BYPASS_COOLDOWN" -eq 0 ]; then
+                        WAIT_CUTOFF=$(_iso_minutes_ago "$REVIEW_WAIT_MINUTES")
+                        if [ -z "$WAIT_CUTOFF" ]; then
+                            echo "$LOG_PREFIX     ⚠️ review-wait cutoff computation failed; skipping this PR this tick (no notification, will retry next tick)" >&2
                             continue
                         fi
-                        echo "$LOG_PREFIX     🔁 Renotifying — ${RENOTIFY_MINUTES}m elapsed since last notification, PR head unchanged"
+                        if [[ "$FIRST_SEEN" > "$WAIT_CUTOFF" ]]; then
+                            echo "$LOG_PREFIX     ⏳ Still inside ${REVIEW_WAIT_MINUTES}m review wait window (since $FIRST_SEEN)"
+                            continue
+                        fi
+
+                        if [ -n "$LAST_NOTIFIED" ]; then
+                            RENOTIFY_CUTOFF=$(_iso_minutes_ago "$RENOTIFY_MINUTES")
+                            if [ -z "$RENOTIFY_CUTOFF" ]; then
+                                echo "$LOG_PREFIX     ⚠️ renotify cutoff computation failed; skipping re-notification this tick" >&2
+                                continue
+                            fi
+                            if [[ "$LAST_NOTIFIED" > "$RENOTIFY_CUTOFF" ]]; then
+                                echo "$LOG_PREFIX     🔕 Already notified at this SHA (since $LAST_NOTIFIED), within ${RENOTIFY_MINUTES}m renotification cooldown"
+                                continue
+                            fi
+                            echo "$LOG_PREFIX     🔁 Renotifying — ${RENOTIFY_MINUTES}m elapsed since last notification, PR head unchanged"
+                        fi
                     fi
 
                     # Build structured payload for Sparky: PR metadata + all
                     # unresolved threads with their comments verbatim + CI
                     # rollup, so the orchestrator can plan without re-fetching.
-                    PAYLOAD=$(echo "$PR" | jq --arg repo "$REPO" --arg pr_key "$PR_KEY" --arg sha "$COMMIT_SHA" --arg check_state "$CHECK_STATE" '{
-                        event: "review_comments",
-                        pr_key: $pr_key,
-                        repo: $repo,
-                        number: .number,
-                        title: .title,
-                        url: .url,
-                        head: .headRefName,
-                        base: .baseRefName,
-                        head_sha: $sha,
-                        ci_status: $check_state,
-                        ci_contexts: [.commits.nodes[0].commit.statusCheckRollup.contexts.nodes[]? | . as $ctx | if .__typename == "CheckRun" then {type:"check", name: $ctx.name, conclusion: $ctx.conclusion, status: $ctx.status} else {type:"status", name: $ctx.context, conclusion: $ctx.state} end],
-                        unresolved_threads: [
-                            .reviewThreads.nodes[]
-                            | select(.isResolved == false and .isOutdated == false)
-                            | {
-                                thread_id: .id,
-                                comments: [.comments.nodes[] | {
-                                    id: .id, author: .author.login, path: .path, line: .line,
-                                    body: .body, created_at: .createdAt
-                                }]
-                              }
-                        ]
-                    }')
+                    #
+                    # outside_diff_reviews: review bodies from known review
+                    # bots. CodeRabbit + Greptile routinely post substantive
+                    # findings in the review BODY rather than as inline
+                    # review threads when the file/line falls outside the
+                    # PR diff — unchanged files affected by the PR, test
+                    # helpers, cache invalidation points, webhook replay
+                    # scope, etc. These were completely invisible to handlers
+                    # until today; a 2026-04-21 handler run on a heavy
+                    # review PR closed all 19 inline threads but missed 3 outside-diff
+                    # findings + 1 nitpick from the same CodeRabbit review
+                    # submission. We pull review bodies authored by known
+                    # review bots, keep only the LATEST submission per
+                    # author (reviews supersede each other), and only when
+                    # the body is non-empty and contains at least one of the
+                    # outside-diff markers we've observed in the wild.
+                    PAYLOAD=$(echo "$PR" | jq --arg repo "$REPO" --arg pr_key "$PR_KEY" --arg sha "$COMMIT_SHA" --arg check_state "$CHECK_STATE" --argjson ack_markers "$PR_ACK_MARKERS" '
+                        . as $pr
+                        # Build a set of (review_id, body_hash) pairs that
+                        # have been acked via PR-comment markers. We key
+                        # on BOTH fields so a coderabbit review whose body
+                        # has been edited since the last ack (e.g. new
+                        # findings added to the same review) re-surfaces.
+                        | ($ack_markers | map({review_id, body_hash}))
+                        as $acked_pairs
+                        | (.reviews.nodes // [])
+                        | map(select(
+                            (.author.login // "") as $login
+                            | ($login | test("coderabbit|greptile|codex-connector|cursor|gemini-code|sourcery-ai|sentry-io|claude\\[bot\\]"; "i"))
+                            and ((.body // "") | length) > 0
+                          ))
+                        # Keep only the latest review per author.
+                        | group_by(.author.login)
+                        | map(sort_by(.submittedAt) | last)
+                        # Keep only reviews whose body looks like it has
+                        # outside-diff / outside-thread actionable content.
+                        # Markers we have seen in the wild:
+                        #   "Outside diff range comments"   (CodeRabbit)
+                        #   "cannot be posted inline" phrasing (apostrophe may be ASCII or U+2019) (CodeRabbit)
+                        #   "Prompt for all review comments with AI agents"
+                        #                                     (CodeRabbit, ingest-ready)
+                        #   "Nitpick comments"               (CodeRabbit)
+                        #   "actionable comments posted"    (CodeRabbit)
+                        #   "Additional Comments"           (Greptile)
+                        #   "P1 Badge" / "P2 Badge"          (chatgpt-codex-connector)
+                        | map(select((.body // "") | test("Outside diff range|can.t be posted inline|Prompt for all review|Nitpick comments|Actionable comments posted|Additional [Cc]omments|P[12] Badge"; "i")))
+                        # Drop reviews that have already been acked with the
+                        # matching body_hash. Handler posts a PR comment
+                        # when it addresses outside-diff findings; see
+                        # pr-ack-outside-diff.sh.
+                        # Drop reviews that have already been acked with the
+                        # matching body_hash. We key on the numeric
+                        # ``databaseId`` (not the opaque GraphQL node id)
+                        # because the ack-marker parser at the top of
+                        # the loop scans for ``review=([0-9]+)`` — and
+                        # pr-ack-outside-diff.sh validates the same.
+                        # Keeping all three (envelope, ack script, parser)
+                        # on the numeric databaseId is the only way the
+                        # suppression round-trip closes.
+                        | map(select(
+                            . as $r
+                            | ($acked_pairs | any(.review_id == ($r.databaseId | tostring) and .body_hash == $r.body_hash)) | not
+                          ))
+                        | map({
+                            review_id: (.databaseId | tostring),
+                            author: .author.login,
+                            state: .state,
+                            submitted_at: .submittedAt,
+                            body_hash: .body_hash,
+                            body: .body
+                          })
+                        as $outside_diff_reviews
+                        | {
+                            event: "review_comments",
+                            pr_key: $pr_key,
+                            repo: $repo,
+                            number: $pr.number,
+                            title: $pr.title,
+                            url: $pr.url,
+                            head: $pr.headRefName,
+                            base: $pr.baseRefName,
+                            head_sha: $sha,
+                            ci_status: $check_state,
+                            ci_contexts: [$pr.commits.nodes[0].commit.statusCheckRollup.contexts.nodes[]? | . as $ctx | if .__typename == "CheckRun" then {type:"check", name: $ctx.name, conclusion: $ctx.conclusion, status: $ctx.status} else {type:"status", name: $ctx.context, conclusion: $ctx.state} end],
+                            unresolved_threads: [
+                                $pr.reviewThreads.nodes[]
+                                | select(.isResolved == false and .isOutdated == false)
+                                | {
+                                    thread_id: .id,
+                                    comments: [.comments.nodes[] | {
+                                        id: .id, author: .author.login, path: .path, line: .line,
+                                        body: .body, created_at: .createdAt
+                                    }]
+                                  }
+                            ],
+                            outside_diff_reviews: $outside_diff_reviews,
+                            outside_diff_review_count: ($outside_diff_reviews | length)
+                          }
+                    ')
                     # Attach the state-update coordinates so the delivery loop
                     # below can mark "notified" only AFTER the wake succeeds.
                     # A dropped wake that had already been marked notified
@@ -779,6 +1102,66 @@ for BLOB in "${NOTIFY_BLOBS[@]}"; do
     STATE_SHA_KEY=$(echo "$BLOB" | jq -r '._state_sha_key // empty')
     STATE_TS=$(echo "$BLOB" | jq -r '._state_ts // empty')
 
+    # Followup file: maintainer dispatch + prior handler escalation for
+    # this PR, if any. See the FOLLOWUPS_DIR comment at the top of the
+    # file. Fold the dispatch into the envelope as ``maintainer_dispatch``
+    # so the handler sees it as initial context. Keep the escalation
+    # history (``prior_escalation``) so the handler knows what question
+    # the dispatch is answering.
+    FOLLOWUP_FILE="$FOLLOWUPS_DIR/$(echo "$PR_KEY" | tr '/#' '--').json"
+    FOLLOWUP_DISPATCH=""
+    FOLLOWUP_BLOB='{}'
+    HAS_DISPATCH=0
+    # Event + head_sha scoping (coderabbit PR#39 _BzXb). A followup
+    # file keyed only by PR_KEY is ambiguous: a dispatch answering a
+    # ``review_comments`` escalation could be mis-consumed by the next
+    # ``ci_failed`` spawn on the same PR. We scope consumption to the
+    # event (and the head_sha) the dispatch was written for. Handlers
+    # that escalate persist ``.event`` and ``.head_sha`` alongside
+    # ``.awaiting_input``; pr-dispatch.sh preserves those fields. If
+    # the stored scope is absent (maintainer-first proactive dispatch,
+    # or a followup written before this change), fall through to the
+    # legacy unscoped behavior.
+    CURRENT_EVENT="$EVENT"
+    CURRENT_HEAD_SHA=$(echo "$BLOB" | jq -r '.head_sha // ""')
+    if [ -f "$FOLLOWUP_FILE" ]; then
+        if FOLLOWUP_BLOB=$(jq -e . "$FOLLOWUP_FILE" 2>/dev/null); then
+            FOLLOWUP_EVENT=$(echo "$FOLLOWUP_BLOB" | jq -r '.event // ""')
+            FOLLOWUP_HEAD_SHA=$(echo "$FOLLOWUP_BLOB" | jq -r '.head_sha // ""')
+            FOLLOWUP_DISPATCH=$(echo "$FOLLOWUP_BLOB" | jq -r '.dispatch // ""')
+            # Event match: if stored event is present, require it.
+            EVENT_OK=1
+            if [ -n "$FOLLOWUP_EVENT" ] && [ "$FOLLOWUP_EVENT" != "$CURRENT_EVENT" ]; then
+                EVENT_OK=0
+            fi
+            # head_sha match: if stored sha is present AND current sha
+            # is known, require them to match so we don't consume a
+            # dispatch whose premises (the code state) have moved on.
+            SHA_OK=1
+            if [ -n "$FOLLOWUP_HEAD_SHA" ] && [ -n "$CURRENT_HEAD_SHA" ] && [ "$FOLLOWUP_HEAD_SHA" != "$CURRENT_HEAD_SHA" ]; then
+                SHA_OK=0
+            fi
+            if [ -n "$FOLLOWUP_DISPATCH" ] && [ "$EVENT_OK" -eq 1 ] && [ "$SHA_OK" -eq 1 ]; then
+                HAS_DISPATCH=1
+                echo "$LOG_PREFIX     📩 Maintainer dispatch present for $PR_KEY (event=$CURRENT_EVENT); folding into envelope and bypassing cooldown"
+            elif [ -n "$FOLLOWUP_DISPATCH" ]; then
+                echo "$LOG_PREFIX     ⏭️  Skipping followup dispatch for $PR_KEY: event_ok=$EVENT_OK sha_ok=$SHA_OK (stored event=$FOLLOWUP_EVENT sha=$FOLLOWUP_HEAD_SHA; current event=$CURRENT_EVENT sha=$CURRENT_HEAD_SHA)"
+                # Clear the followup blob from the envelope-folding path
+                # so maintainer_dispatch/prior_escalation fields are NOT
+                # folded into this mismatched envelope.
+                FOLLOWUP_BLOB='{}'
+            fi
+        else
+            echo "$LOG_PREFIX     ⚠️  Followup file for $PR_KEY is malformed JSON; ignoring" >&2
+            FOLLOWUP_BLOB='{}'
+        fi
+    fi
+
+    # Safe filename form of PR_KEY for followup paths (same transform as
+    # the envelope-temp filename and the spawn dedup prefix). Inlined into
+    # handler prompts so agents know exactly which file to write.
+    PR_KEY_SAFE=$(echo "$PR_KEY" | tr '/#' '--')
+
     if [ "$EVENT" = "review_comments" ]; then
         THREAD_COUNT=$(echo "$BLOB" | jq '.unresolved_threads | length')
 
@@ -797,12 +1180,18 @@ for BLOB in "${NOTIFY_BLOBS[@]}"; do
         # maintainer AND wake Sparky. State is only marked notified when
         # both deliveries succeed — a partial failure leaves the SHA
         # "not notified" so the next tick retries.
-        if [ "$THREAD_COUNT" -gt "$HANDLER_MAX_INLINE_THREADS" ]; then
+        # Outside-diff review bodies are as much work as inline threads,
+        # so count them against the inline-handler budget. A CodeRabbit
+        # review with 4 outside-diff findings + 10 inline threads is
+        # effectively 14 findings worth of handler work.
+        OUTSIDE_DIFF_COUNT=$(echo "$BLOB" | jq '.outside_diff_review_count // 0')
+        TOTAL_COUNT=$(( THREAD_COUNT + OUTSIDE_DIFF_COUNT ))
+        if [ "$TOTAL_COUNT" -gt "$HANDLER_MAX_INLINE_THREADS" ]; then
             PR_URL=$(echo "$BLOB" | jq -r '.url')
             THREAD_IDS=$(echo "$BLOB" | jq -r '[.unresolved_threads[].thread_id] | join(",")')
-            ESCALATION_MSG=$(printf '[ESCALATION] %s has %s unresolved review thread(s) — above the inline-handler threshold (%s). Aggregate review PRs are orchestration work. threads=%s url=%s' \
-                "$PR_KEY" "$THREAD_COUNT" "$HANDLER_MAX_INLINE_THREADS" "$THREAD_IDS" "$PR_URL")
-            echo "$LOG_PREFIX     🚨 Thread count $THREAD_COUNT > $HANDLER_MAX_INLINE_THREADS; escalating to maintainer + main session (no handler spawn)"
+            ESCALATION_MSG=$(printf '[ESCALATION] %s has %s unresolved review thread(s) + %s outside-diff review finding(s) — above the inline-handler threshold (%s). Aggregate review PRs are orchestration work. threads=%s url=%s' \
+                "$PR_KEY" "$THREAD_COUNT" "$OUTSIDE_DIFF_COUNT" "$HANDLER_MAX_INLINE_THREADS" "$THREAD_IDS" "$PR_URL")
+            echo "$LOG_PREFIX     🚨 Findings count $TOTAL_COUNT (inline=$THREAD_COUNT + outside-diff=$OUTSIDE_DIFF_COUNT) > $HANDLER_MAX_INLINE_THREADS; escalating to maintainer + main session (no handler spawn)"
             ANNOUNCE_OK=0
             WAKE_OK=0
             _announce_to_maintainer "$ESCALATION_MSG" && ANNOUNCE_OK=1
@@ -818,15 +1207,25 @@ for BLOB in "${NOTIFY_BLOBS[@]}"; do
             continue
         fi
 
-        HEADER="📝 PR handler: $PR_KEY has $THREAD_COUNT unresolved review thread(s) and the ${REVIEW_WAIT_MINUTES}m wait window has elapsed."
+        if [ "$OUTSIDE_DIFF_COUNT" -gt 0 ]; then
+            HEADER="📝 PR handler: $PR_KEY has $THREAD_COUNT unresolved review thread(s) and $OUTSIDE_DIFF_COUNT outside-diff review finding(s); the ${REVIEW_WAIT_MINUTES}m wait window has elapsed."
+        else
+            HEADER="📝 PR handler: $PR_KEY has $THREAD_COUNT unresolved review thread(s) and the ${REVIEW_WAIT_MINUTES}m wait window has elapsed."
+        fi
         FOOTER="You are an isolated handler subagent. Read the pr-review-hygiene skill first, then own this PR end-to-end via the pr-worktree pattern (~/pr-work/<repo>/pr-<N>/): commit fixes, push, reply + resolve each thread.
 
 INSTRUCTIONS
 
 1. Read pr-review-hygiene skill BEFORE touching the PR.
-2. Read the envelope JSON from the file path shown below this instruction block (use the ``read`` tool, then ``jq`` if you need to slice it). The envelope has the PR id, url, head_sha, CI status, and the full list of unresolved threads with author/path/line/body/created_at for each comment.
+2. Read the envelope JSON from the file path shown below this instruction block (use the ``read`` tool, then ``jq`` if you need to slice it). The envelope has the PR id, url, head_sha, CI status, the full list of unresolved inline threads (``unresolved_threads``), AND a separate list of outside-diff review bodies (``outside_diff_reviews``) from known review bots (CodeRabbit, Greptile, Codex, Cursor, Gemini). The envelope may also contain a ``maintainer_dispatch`` field — see rule 4.
+2a. OUTSIDE-DIFF REVIEWS ARE AS IMPORTANT AS INLINE THREADS. CodeRabbit, Greptile and other bots frequently post substantive findings in the review BODY when the file/line isn't in the PR diff (e.g. unchanged files affected by the PR, cache invalidation helpers, webhook replay scope, test helpers). These are NOT in reviewThreads — they are ONLY in ``outside_diff_reviews``. Process each outside-diff review: parse the body for ``Outside diff range comments`` sections and the terminal ``Prompt for all review comments with AI agents`` section. CodeRabbit's ``Prompt for all review comments with AI agents`` block is literally machine-readable instructions — you can ingest it directly and act on each finding. Address outside-diff findings in the same commit as inline-thread fixes when they touch related code; otherwise split into a second commit.
+2b. HOW TO ACKNOWLEDGE OUTSIDE-DIFF FINDINGS. Outside-diff review bodies have NO GitHub ``resolve`` button — they are NOT threads. If you just fix the code and push, the next pr-manager tick would re-surface the same review to a fresh handler (infinite loop). The ack channel is a PR-level comment with an HTML marker. For EACH outside-diff review you address, run:
+    $HOME/.clawdbot/pr-ack-outside-diff.sh <pr_key> <review_id> <body_hash> <commit_sha> <summary>
+  where <pr_key> is ``${PR_KEY}``, <review_id> is the ``review_id`` field from the envelope's ``outside_diff_reviews`` entry, <body_hash> is the ``body_hash`` field from the same entry, <commit_sha> is the full or short SHA of the commit that addressed the findings, and <summary> is a one-line plain-English summary. The script posts a hidden HTML marker comment that pr-manager reads on the next tick to suppress the review. If the review body changes later (bot added new findings to the same review), the body_hash changes and the review re-surfaces automatically — so you don't need to worry about future review updates.
+  Skipping the ack means the next handler spawn re-processes the same findings. Always ack after fixing. The 2026-04-21 incident that motivated this channel had a handler miss 3 outside-diff findings + 1 nitpick on a heavy review; this ack channel is how we prevent that failure mode in future.
 3. Emit ZERO intermediate assistant text. Every assistant message gets announced to the maintainer's Telegram, so intermediate 'Now let me...' narrations spam the chat. Do all reasoning silently via tool-use. Produce exactly ONE final text reply at the end.
-4. Escalate via sessions_send to main label='main' for any product/design call you can't make unilaterally. The escalation message MUST start with '[ESCALATION] ${PR_KEY} ' and include the affected thread_ids so the main session knows which PR and which threads you couldn't handle.
+4. If you cannot proceed without a product/design call, DO NOT use ``sessions_send``. Instead, persist the question to the followup file at ``$HOME/.clawdbot/followups/${PR_KEY_SAFE}.json`` as JSON with these string fields: awaiting_input (a one-sentence question), threads (array of affected thread_ids), detail (what you need and why), AND event + head_sha (copy these from THIS envelope — event is the string review_comments and head_sha comes from envelope.head_sha) so the maintainer's dispatch is only consumed by a handler firing on the same event+SHA. Overwrite the file if it already exists (your new question supersedes any prior one). Then exit with a ⚠️ Telegram reply. The maintainer will answer by adding a dispatch field to the same file; the NEXT pr-manager tick will fold that dispatch into a fresh handler envelope matching the same event+SHA, bypassing the review-wait and cooldown windows. This replaces the old sessions_send escalation channel which was unreliable because handler sessions exit before the maintainer reply lands.
+4a. If the envelope you received contains ``maintainer_dispatch`` (non-empty), that is the maintainer's answer to a PRIOR escalation on this PR. Execute against that dispatch as your primary instruction, cross-referenced against the current list of unresolved threads. The maintainer's dispatch supersedes any default handling heuristic.
 
 Step 0 (staleness check, MANDATORY before any other work):
 
@@ -839,7 +1238,8 @@ Before touching any file or thread, fetch CURRENT state with gh and cross-check 
      - If headRefOid != the envelope's head_sha: new commits landed since the envelope was written. Reply '⚠️ <short-repo>#<n> needs you — new commits landed since my task was queued' and exit. Do NOT attempt to graft your own fixes onto a branch tip you haven't read.
 
   b) Run the same GraphQL query the envelope used to count unresolved threads. The graphql body should match the one the envelope-writer in pr-manager.sh uses: fetch reviewThreads (first:100) with id/isResolved/isOutdated, then filter isResolved == false AND isOutdated == false, and count.
-     - If 0 unresolved: reply '✅ <short-repo>#<n>: all threads already resolved, no action taken' and exit.
+     - If 0 unresolved AND the envelope's ``outside_diff_review_count`` is also 0: reply '✅ <short-repo>#<n>: all threads already resolved, no action taken' and exit.
+     - If unresolved is 0 but outside_diff_review_count > 0: you still have work — address the outside-diff findings.
      - If the set differs significantly from the envelope (e.g. envelope listed 5 threads, only 1 unresolved now): work only the currently-unresolved subset. Do not reply to or re-open threads that are already resolved.
 
 This check costs you ~2 tool calls and under 5 seconds. Skipping it costs up to 90 minutes and a full Opus budget on work that was already done. Run it.
@@ -854,6 +1254,8 @@ Example sentences:
   - 3 review threads resolved, mobile drag regression fixed
   - CI failure addressed, 112/112 tests green
   - 2 of 4 threads resolved, 2 deferred pending a product call
+  - 19 threads + 4 outside-diff findings addressed
+  - 12 threads resolved, 3 outside-diff cache-eviction findings fixed
 
 Escalation path — two lines:
   ⚠️ <short-repo>#<number> needs you — <one plain-English reason>
@@ -870,7 +1272,7 @@ Rules:
 
 Internal verification — NOT shown to the maintainer. Before posting the success reply, confirm the PR state via gh pr view and the unresolved-threads GraphQL actually matches what you plan to claim. If it does not, use the escalation format.
 
-For escalations you route via sessions_send to the main session label=main, the sessions_send body MUST still carry the structured context [ESCALATION] ${PR_KEY} head=<head_branch> base=<base_branch> reason=<reason> threads=<comma-separated thread_ids> — the main-session orchestrator needs those fields. The Telegram announce to the maintainer stays human."
+Escalations no longer go through sessions_send. Write the structured question to the followup file (per rule 4) and exit with the ⚠️ Telegram reply. The Telegram reply stays human — short one-sentence reason, no structured tags, no thread IDs. The followup file carries the machine-readable detail; the maintainer will see both the human Telegram line AND the file-based question. The file-based channel survives session exit."
     else
         HEADER="🔴 PR handler: $PR_KEY has a failed CI run (all review threads resolved)."
         FOOTER="You are an isolated handler subagent. Read the pr-review-hygiene skill first, then fix the failed CI via the pr-worktree pattern (~/pr-work/<repo>/pr-<N>/).
@@ -880,7 +1282,8 @@ INSTRUCTIONS
 1. Read pr-review-hygiene skill BEFORE touching the PR.
 2. Read the envelope JSON from the file path shown below this instruction block (use the ``read`` tool, then ``jq`` if you need to slice it). ``failed_job_logs`` has the tail of the red job.
 3. Emit ZERO intermediate assistant text. Every assistant message gets announced to the maintainer's Telegram, so narrations spam the chat. Do all reasoning silently via tool-use. Produce exactly ONE final text reply at the end.
-4. Escalate via sessions_send to main label='main' if the failure is infra-level (not a code bug) or requires a design call. The escalation message MUST start with '[ESCALATION] ${PR_KEY} ' so the main session can route it.
+4. If you cannot fix the failure without a design call or if the failure is infra-level (not a code bug), write the question to the followup file at ``$HOME/.clawdbot/followups/${PR_KEY_SAFE}.json`` as JSON with these string fields: awaiting_input (a one-sentence question), detail (a logs excerpt plus what you need), AND event + head_sha (copy from THIS envelope — event is the string ci_failed and head_sha comes from envelope.head_sha) so the maintainer's dispatch is only consumed by a handler firing on the same event+SHA. Then exit with the ⚠️ Telegram reply. Do NOT use sessions_send — the handler session exits before replies can land.
+4a. If the envelope contains ``maintainer_dispatch``, that is the maintainer's answer to a prior escalation on this PR. Execute against that dispatch as your primary instruction.
 
 Step 0 (staleness check, MANDATORY before any other work):
 
@@ -907,7 +1310,7 @@ Escalation path — two lines:
   ⚠️ <short-repo>#<number> needs you — <one plain-English reason>
   <url>
 
-Rules: same as the review_comments branch. No SHA, no mergeStateStatus, no (head→base) annotation, no jargon, under 100 chars, start with emoji + short repo name. The sessions_send body for escalations still carries the structured [ESCALATION] envelope for main-session routing."
+Rules: same as the review_comments branch. No SHA, no mergeStateStatus, no (head→base) annotation, no jargon, under 100 chars, start with emoji + short repo name. Escalations are written to the followup file, not sessions_send."
     fi
 
     # Envelope is written to a TEMP FILE and the handler is told to
@@ -929,7 +1332,23 @@ Rules: same as the review_comments branch. No SHA, no mergeStateStatus, no (head
     # same PR don't collide. Stale files are reaped at the end of
     # this script (``find /tmp -name 'pr-handler-*.json' -mtime +1``).
     ENVELOPE_FILE=$(printf '/tmp/pr-handler-%s-%s.json' "$(echo "$PR_KEY" | tr '/#' '--')" "$(jq -rn 'now | floor')")
-    echo "$BLOB" | jq 'del(._state_key, ._state_sha_key, ._state_ts)' > "$ENVELOPE_FILE"
+    # Fold the maintainer-dispatch + prior-escalation context (if any)
+    # into the envelope so the handler sees it on Read. FOLLOWUP_BLOB is
+    # ``{}`` when no followup file exists, which jq merges as a no-op.
+    echo "$BLOB" \
+        | jq --argjson followup "$FOLLOWUP_BLOB" '
+            del(._state_key, ._state_sha_key, ._state_ts)
+            | . + (
+                if ($followup | length) > 0 then
+                  {
+                    maintainer_dispatch: ($followup.dispatch // null),
+                    prior_escalation: ($followup.awaiting_input // null),
+                    prior_escalation_detail: ($followup.detail // null),
+                    prior_escalation_threads: ($followup.threads // [])
+                  }
+                else {} end
+              )
+          ' > "$ENVELOPE_FILE"
 
     TEXT=$(printf '%s\n\n%s\n\nRead the envelope JSON at: %s\n' "$HEADER" "$FOOTER" "$ENVELOPE_FILE")
 
@@ -950,6 +1369,52 @@ Rules: same as the review_comments branch. No SHA, no mergeStateStatus, no (head
             if [ -n "$STATE_KEY" ] && [ -n "$STATE_SHA_KEY" ] && [ -n "$STATE_TS" ]; then
                 jq --arg state_key "$STATE_KEY" --arg sha_key "$STATE_SHA_KEY" --arg ts "$STATE_TS" \
                     '.[$state_key][$sha_key] = $ts' "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+            fi
+            # Record this spawn's pre-run finding count so the next
+            # tick on the same SHA can detect a silent no-op (prior
+            # handler completed with zero progress). Use TOTAL_COUNT
+            # (inline threads + outside-diff reviews) not just inline
+            # thread length — a handler that only addresses outside-diff
+            # findings would otherwise look like a no-op (threads
+            # unchanged) and re-spawn every tick (gemini PR#39 _BZV2).
+            # Persist handler_spawns only for ``review_comments``
+            # spawns (coderabbit PR#39 _BzXh). The silent-no-op
+            # detector reads this state to decide whether to bypass the
+            # renotify cooldown on the next tick — but it's ONLY
+            # consulted inside the HAS_COMMENTS path. A ``ci_failed``
+            # spawn on a SHA with zero review comments would otherwise
+            # write ``inline_unresolved_count: 0``, and the very next
+            # review_comments tick on the same SHA would satisfy
+            # ``UNRESOLVED >= 0`` and short-circuit the 15-min review
+            # wait window. Restricting the write to review_comments
+            # spawns keeps the state slot meaningful for its one
+            # consumer. Also record the inline count separately from
+            # the total so the detector can compare like-for-like.
+            if [ "$EVENT" = "review_comments" ]; then
+                SPAWN_INLINE_COUNT=${THREAD_COUNT:-0}
+                SPAWN_TOTAL_COUNT=${TOTAL_COUNT:-0}
+                SPAWN_OUTSIDE_COUNT=${OUTSIDE_DIFF_COUNT:-0}
+                SPAWN_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+                jq --arg sha_key "$STATE_SHA_KEY" \
+                   --argjson inline "$SPAWN_INLINE_COUNT" \
+                   --argjson outside "$SPAWN_OUTSIDE_COUNT" \
+                   --argjson total "$SPAWN_TOTAL_COUNT" \
+                   --arg ts "$SPAWN_TS" \
+                   '.handler_spawns[$sha_key] = {inline_unresolved_count: $inline, outside_diff_count: $outside, unresolved_count: $total, spawned_at: $ts}' \
+                   "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+            fi
+            # Consume the followup file: the dispatch + escalation have
+            # been folded into the envelope; a second spawn on a future
+            # tick would re-deliver the same dispatch, causing duplicate
+            # work. Delete only after confirmed successful spawn so a
+            # failed spawn leaves the dispatch for the next tick retry.
+            # Only delete when the dispatch's stored event+head_sha
+            # match the spawn we just fired (coderabbit PR#39 _BzXb);
+            # HAS_DISPATCH is already gated on that match above, so
+            # a 1 here implies the stored scope aligned with this spawn.
+            if [ "$HAS_DISPATCH" -eq 1 ] && [ -f "$FOLLOWUP_FILE" ]; then
+                rm -f "$FOLLOWUP_FILE"
+                echo "$LOG_PREFIX     🗑️  Consumed followup file for $PR_KEY (dispatch delivered for event=$EVENT)"
             fi
             ;;
         2)
@@ -1000,6 +1465,7 @@ else
       .first_seen_unresolved = (.first_seen_unresolved // {} | to_entries | map(select(.value > $cutoff)) | from_entries)
       | .notified_reviews = (.notified_reviews // {} | to_entries | map(select(.value > $cutoff)) | from_entries)
       | .notified_ci = (.notified_ci // {} | to_entries | map(select(.value > $cutoff)) | from_entries)
+      | .handler_spawns = (.handler_spawns // {} | to_entries | map(select(.value.spawned_at > $cutoff)) | from_entries)
     ' "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
 fi
 
