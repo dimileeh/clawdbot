@@ -40,24 +40,51 @@ log() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*" >> "$LOG_FILE"; }
 
 [ -f "$GATEWAY_ERR_LOG" ] || exit 0
 
-# Cool-down: skip if we restarted within COOLDOWN_MINUTES. This keeps the
-# script idempotent under the 5-min cron cadence even when stalls are
-# still queued in the log (in-flight grace for the new process).
+# Read the last bounce time from state (used both for cool-down and to
+# floor the stall-count window so we never re-count historical pre-bounce
+# stalls after cool-down expires).
+LAST_RESTART=""
+LAST_BOUNCE_EPOCH=0
 if [ -f "$STATE_FILE" ]; then
     LAST_RESTART=$(cat "$STATE_FILE" 2>/dev/null || true)
     if [ -n "$LAST_RESTART" ]; then
-        CUTOFF=$(jq -rn --argjson m "$COOLDOWN_MINUTES" \
-            'now - ($m * 60) | strftime("%Y-%m-%dT%H:%M:%SZ")' 2>/dev/null || true)
-        if [ -n "$CUTOFF" ] && [[ "$LAST_RESTART" > "$CUTOFF" ]]; then
-            exit 0
-        fi
+        LAST_BOUNCE_EPOCH=$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$LAST_RESTART" +%s 2>/dev/null || echo 0)
     fi
 fi
 
-# Count recent polling stalls. The tail bounds the work; the cool-down
-# above prevents historical stalls from tripping a second bounce.
-STALL_COUNT=$(tail -n "$TAIL_LINES" "$GATEWAY_ERR_LOG" 2>/dev/null \
-    | grep -c "Polling stall detected" || true)
+# Cool-down: skip if we restarted within COOLDOWN_MINUTES.
+NOW_EPOCH=$(date +%s)
+if [ "$LAST_BOUNCE_EPOCH" -gt 0 ]; then
+    COOLDOWN_END_EPOCH=$((LAST_BOUNCE_EPOCH + COOLDOWN_MINUTES * 60))
+    if [ "$NOW_EPOCH" -lt "$COOLDOWN_END_EPOCH" ]; then
+        exit 0
+    fi
+fi
+
+# Floor the count window: only stalls newer than max(last-bounce, now-2h).
+# Without this floor, after cool-down expires the tail would still contain
+# historical pre-bounce stalls and would re-trigger a bounce on a healthy
+# gateway. The 2h cap is the no-state fallback for first-run.
+FLOOR_EPOCH=$((NOW_EPOCH - 2 * 3600))
+if [ "$LAST_BOUNCE_EPOCH" -gt "$FLOOR_EPOCH" ]; then
+    FLOOR_EPOCH=$LAST_BOUNCE_EPOCH
+fi
+
+# Count "Polling stall detected" entries newer than FLOOR_EPOCH. Log lines
+# start with an ISO-8601 timestamp like "2026-04-28T10:45:11.286+01:00";
+# strip the milliseconds and reformat the TZ (BSD date wants +HHMM, not
+# +HH:MM) before parsing to epoch.
+STALL_COUNT=0
+while IFS= read -r line; do
+    ts=$(printf '%s\n' "$line" | awk '{print $1}')
+    [ -z "$ts" ] && continue
+    ts_norm=$(printf '%s' "$ts" \
+        | sed -E 's/\.[0-9]+//; s/([+-][0-9]{2}):([0-9]{2})$/\1\2/')
+    epoch=$(date -j -f "%Y-%m-%dT%H:%M:%S%z" "$ts_norm" +%s 2>/dev/null || echo 0)
+    if [ "$epoch" -gt "$FLOOR_EPOCH" ]; then
+        STALL_COUNT=$((STALL_COUNT + 1))
+    fi
+done < <(tail -n "$TAIL_LINES" "$GATEWAY_ERR_LOG" 2>/dev/null | grep "Polling stall detected" || true)
 
 if [ "${STALL_COUNT:-0}" -lt "$STALL_THRESHOLD" ]; then
     exit 0
