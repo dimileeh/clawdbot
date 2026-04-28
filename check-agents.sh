@@ -195,3 +195,34 @@ else
   echo "  \"alerts\": null"
 fi
 echo "}"
+
+# ─── Auto-cleanup pass ──────────────────────────────────────────────────
+# Scan the registry for status=done entries whose tracked PR is MERGED or
+# CLOSED, and run cleanup-task.sh to tear down the worktree + registry
+# entry. Without this, "done" tasks accumulate forever — last night's
+# active-tasks.json had ~9 stale entries with merged PRs whose worktrees
+# (and tmux sessions) were still hanging around. The lingering worktrees
+# also bite the next spawn against the same branch: spawn-agent.sh's
+# auto-suffix-on-conflict path silently routes the new agent to a fresh
+# branch off main, defeating the whole point of follow-up commits.
+#
+# Runs AFTER the JSON output above so callers see a consistent snapshot
+# of the per-task classification before the registry mutates underneath
+# them. Disable via CLAWDBOT_AUTO_CLEANUP=0.
+if [ "${CLAWDBOT_AUTO_CLEANUP:-1}" != "0" ] && [ -x "$CLAWDBOT_HOME/cleanup-task.sh" ]; then
+  CLEANUP_IDS=()
+  while IFS=$'\t' read -r ID PR_NUM REPO_FOR_ID; do
+    [ -z "$ID" ] && continue
+    [ -z "$PR_NUM" ] || [ "$PR_NUM" = "null" ] && continue
+    [ -z "$REPO_FOR_ID" ] || [ "$REPO_FOR_ID" = "null" ] && continue
+    [ ! -d "$REPO_FOR_ID" ] && continue
+    PR_ST=$(cd "$REPO_FOR_ID" && gh pr view "$PR_NUM" --json state --jq '.state' 2>/dev/null || echo "")
+    if [ "$PR_ST" = "MERGED" ] || [ "$PR_ST" = "CLOSED" ]; then
+      CLEANUP_IDS+=("$ID")
+    fi
+  done < <(jq -r '.[] | select(.status == "done") | [.id, (.pr // ""), (.repoPath // "")] | @tsv' "$REGISTRY" 2>/dev/null || true)
+
+  for ID in ${CLEANUP_IDS[@]+"${CLEANUP_IDS[@]}"}; do
+    bash "$CLAWDBOT_HOME/cleanup-task.sh" "$ID" >/dev/null 2>&1 || true
+  done
+fi
