@@ -70,14 +70,15 @@ for i in $(seq 0 $((TASK_COUNT - 1))); do
     continue
   fi
 
-  # 1. Liveness: runner is alive if EITHER its PID is still running OR the
-  # tmux session is up. spawn-agent.sh now launches via nohup (survives
-  # even when tmux dies inside some OpenClaw exec contexts), so the PID
-  # check is primary; tmux is the legacy fallback for entries without
-  # runnerPid set.
+  # 1. Liveness: when runnerPid is recorded (nohup spawn path), it IS the
+  # source of truth — a tmux session lingering past the runner doesn't make
+  # the agent alive. Only fall back to tmux for legacy entries that pre-date
+  # nohup and lack a runnerPid.
   TMUX_ALIVE=false
-  if [ -n "$RUNNER_PID" ] && kill -0 "$RUNNER_PID" 2>/dev/null; then
-    TMUX_ALIVE=true
+  if [ -n "$RUNNER_PID" ] && [ "$RUNNER_PID" != "null" ]; then
+    if kill -0 "$RUNNER_PID" 2>/dev/null; then
+      TMUX_ALIVE=true
+    fi
   elif tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
     TMUX_ALIVE=true
   fi
@@ -108,6 +109,15 @@ for i in $(seq 0 $((TASK_COUNT - 1))); do
   # 4. Determine action
   ACTION="none"
   NEW_STATUS="$STATUS"
+
+  # If the PR is already merged or closed, the work is done regardless of what
+  # tmux says. Claude can exit cleanly while the surrounding shell hangs around
+  # (we've seen sessions persist for days after the agent finished); without
+  # this short-circuit those entries stay status=running forever and clog the
+  # precheck wake path.
+  if [ -n "$PR_NUMBER" ] && { [ "$PR_STATE" = "MERGED" ] || [ "$PR_STATE" = "CLOSED" ]; }; then
+    TMUX_ALIVE=false
+  fi
 
   # If tmux is dead, try to read the wrapped command exit code from the task log.
   EXIT_CODE=""

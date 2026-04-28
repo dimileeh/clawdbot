@@ -36,9 +36,32 @@ fi
 # Also count matching tmux sessions (pre-nohup tasks + current observability panes).
 TMUX_IDS=$(tmux ls 2>/dev/null | grep "^agent-" | cut -d: -f1 | sed 's/^agent-//' | tr '\n' ' ' || true)
 
-# Union the two sources.
-COMBINED=$(printf '%s\n' "${LIVE_IDS[@]}" $TMUX_IDS | sort -u | grep -v '^$' || true)
+# Union the two sources. The `${LIVE_IDS[@]+...}` expansion is required under
+# `set -u` because an empty array would otherwise trip "unbound variable".
+COMBINED=$(printf '%s\n' ${LIVE_IDS[@]+"${LIVE_IDS[@]}"} $TMUX_IDS | sort -u | grep -v '^$' || true)
 ACTIVE=$(printf '%s\n' "$COMBINED" | grep -c . || true)
+
+# Reap zombies: any status=running entry whose runnerPid AND tmux session are
+# both dead. check-agents.sh already knows how to transition those to done/
+# failed/etc. and is pure shell (no LLM call), so we invoke it directly when
+# we find any. Without this, ghost entries linger forever — they don't show
+# up in $ACTIVE so the wake path skips them, and Sparky never sees them.
+if [ -f "$REGISTRY" ]; then
+    ZOMBIES=0
+    while IFS=$'\t' read -r ZID ZPID ZTMUX; do
+        [ -z "$ZID" ] && continue
+        if [ -n "$ZPID" ] && [ "$ZPID" != "null" ] && kill -0 "$ZPID" 2>/dev/null; then
+            continue
+        fi
+        if [ -n "$ZTMUX" ] && [ "$ZTMUX" != "null" ] && tmux has-session -t "$ZTMUX" 2>/dev/null; then
+            continue
+        fi
+        ZOMBIES=$((ZOMBIES + 1))
+    done < <(jq -r '.[] | select(.status == "running") | [.id, (.runnerPid // ""), (.tmuxSession // "")] | @tsv' "$REGISTRY" 2>/dev/null || true)
+    if [ "$ZOMBIES" -gt 0 ]; then
+        bash "$CLAWDBOT_HOME/check-agents.sh" >/dev/null 2>&1 || true
+    fi
+fi
 
 if [ "$ACTIVE" -eq 0 ]; then
     exit 0
