@@ -676,6 +676,60 @@ $REV_ENVELOPE
                     else
                         echo "$LOG_PREFIX     Not ready: checks=$CHECK_STATE mergeable=$MERGEABLE"
                     fi
+
+                    # ─── Auto-rebase on conflict ─────────────────────────────
+                    # When CI is green but the branch has fallen behind base,
+                    # the only thing keeping the PR from merging is the stale
+                    # base. Spawn a rebase subagent once per head SHA — same
+                    # one-shot pattern as swarm_review. The agent rebases,
+                    # force-pushes, exits; the next tick re-evaluates and
+                    # routes the PR through the normal READY_DEV path.
+                    #
+                    # Only act on PRs targeting the integration branch — PRs
+                    # to main (or third branches) require human judgment.
+                    # Without this, a CONFLICTING PR sits silent forever:
+                    # 2026-04-27 → 28, PR #204 logged 25+ identical NOT_READY
+                    # ticks across 9 hours before the maintainer rebased it
+                    # by hand. SHA-keyed so a manual fix or re-push starts
+                    # the loop fresh.
+                    if [ "$MERGEABLE" = "CONFLICTING" ] \
+                        && [ "$CHECK_STATE" = "SUCCESS" ] \
+                        && [ "$PR_BASE" = "$INTEGRATION_BRANCH" ]; then
+                        ALREADY_SPAWNED=$(jq -r ".spawned_conflict_resolutions[\"$SHA_KEY\"] // \"\"" "$STATE_FILE")
+                        if [ -n "$ALREADY_SPAWNED" ]; then
+                            echo "$LOG_PREFIX     🔧 Rebase agent already spawned for this SHA at $ALREADY_SPAWNED"
+                        else
+                            REBASE_ENVELOPE=$(jq -n \
+                                --arg pk "$PR_KEY" --arg repo "$REPO" \
+                                --argjson num "$PR_NUM" --arg url "$PR_URL" \
+                                --arg sha "$COMMIT_SHA" --arg head "$PR_HEAD" \
+                                --arg base "$PR_BASE" \
+                                '{event:"pr_rebase", pr_key:$pk, repo:$repo, number:$num, url:$url, head_sha:$sha, head:$head, base:$base}')
+
+                            REBASE_TEXT="🔧 PR rebaser: $PR_KEY — $PR_HEAD has conflicts against $PR_BASE but CI is green. Rebase, force-push, exit.
+
+INSTRUCTIONS
+
+1. Locate or create a worktree for $PR_HEAD. The repo lives at the local path matching $REPO under \$HOME (e.g. \$HOME/$(echo "$REPO" | cut -d/ -f2)). Prefer \`git worktree add\` over a checkout in a busy main copy.
+2. Fetch latest base: \`git fetch origin $PR_BASE\`.
+3. Rebase onto the base: \`git rebase origin/$PR_BASE\`.
+4. If the rebase succeeds cleanly, push: \`git push --force-with-lease origin $PR_HEAD\`. Exit with a one-line summary.
+5. If the rebase has unresolvable conflicts (semantic merge, large overlap with main, schema collisions), abort with \`git rebase --abort\`, then escalate via \`sessions_send\` with prefix \`[ESCALATION] $PR_KEY\` and a one-paragraph summary naming the conflicting paths and why automatic rebase is unsafe. Do NOT push partial work.
+6. Emit ZERO intermediate assistant text. Produce exactly ONE final summary message at the end.
+
+Envelope:
+\`\`\`json
+$REBASE_ENVELOPE
+\`\`\`"
+
+                            if _spawn_handler_subagent "pr_rebase" "$PR_KEY" "$REBASE_TEXT"; then
+                                jq --arg sha_key "$SHA_KEY" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                                    '.spawned_conflict_resolutions[$sha_key] = $ts' \
+                                    "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+                                echo "$LOG_PREFIX     🔧 Spawned rebase agent for $PR_KEY (SHA ${COMMIT_SHA:0:7})"
+                            fi
+                        fi
+                    fi
                     ;;
             esac
 
