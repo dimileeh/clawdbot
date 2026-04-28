@@ -103,7 +103,7 @@ _iso_minutes_ago() {
 [ -f "$STATE_FILE" ] || echo '{}' > "$STATE_FILE"
 # Ensure top-level keys. notified_reviews / notified_ci are keyed by
 # "<repo>#<num>@<sha>" so a new commit cleanly resets them.
-for KEY in notified_main_prs merged_prs created_dev_main_prs first_seen_unresolved notified_reviews notified_ci spawned_reviews review_rounds; do
+for KEY in notified_main_prs merged_prs created_dev_main_prs first_seen_unresolved notified_reviews notified_ci spawned_reviews review_rounds spawned_conflict_resolutions escalated_conflicts; do
     if ! jq -e ".$KEY" "$STATE_FILE" >/dev/null 2>&1; then
         jq ". + {\"$KEY\":{}}" "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
     fi
@@ -697,7 +697,47 @@ $REV_ENVELOPE
                         && [ "$PR_BASE" = "$INTEGRATION_BRANCH" ]; then
                         ALREADY_SPAWNED=$(jq -r ".spawned_conflict_resolutions[\"$SHA_KEY\"] // \"\"" "$STATE_FILE")
                         if [ -n "$ALREADY_SPAWNED" ]; then
-                            echo "$LOG_PREFIX     🔧 Rebase agent already spawned for this SHA at $ALREADY_SPAWNED"
+                            # The auto-rebase agent has been spawned but the
+                            # SHA hasn't advanced. If it's been long enough
+                            # that we'd have expected the agent to push by
+                            # now (default 30m), escalate to the maintainer
+                            # AND wake Sparky — the agent likely crashed,
+                            # was never picked up by the gateway, or hit a
+                            # semantic conflict it can't resolve. Without
+                            # this fail-safe, a failed rebase agent leaves
+                            # the PR silent until somebody happens to
+                            # notice the lingering CONFLICTING state.
+                            STALE_REBASE_MINUTES=$(_parse_positive_int "${CLAWDBOT_STALE_REBASE_MINUTES:-30}" 30 CLAWDBOT_STALE_REBASE_MINUTES)
+                            STALE_CUTOFF=$(_iso_minutes_ago "$STALE_REBASE_MINUTES")
+                            if [ -n "$STALE_CUTOFF" ] && [[ "$ALREADY_SPAWNED" < "$STALE_CUTOFF" ]]; then
+                                LAST_ESCALATED=$(jq -r ".escalated_conflicts[\"$SHA_KEY\"] // \"\"" "$STATE_FILE")
+                                ESCALATE=1
+                                if [ -n "$LAST_ESCALATED" ]; then
+                                    RENOTIFY_CUTOFF=$(_iso_minutes_ago "$RENOTIFY_MINUTES")
+                                    if [ -n "$RENOTIFY_CUTOFF" ] && [[ "$LAST_ESCALATED" > "$RENOTIFY_CUTOFF" ]]; then
+                                        ESCALATE=0
+                                        echo "$LOG_PREFIX     🔕 Stale-conflict escalation suppressed (last at $LAST_ESCALATED, within ${RENOTIFY_MINUTES}m cooldown)"
+                                    fi
+                                fi
+                                if [ "$ESCALATE" -eq 1 ]; then
+                                    ESC_MSG=$(printf '[ESCALATION] %s rebase agent spawned %s but SHA %s unchanged after ~%sm. Manual rebase or different approach likely needed. %s' \
+                                        "$PR_KEY" "$ALREADY_SPAWNED" "${COMMIT_SHA:0:7}" "$STALE_REBASE_MINUTES" "$PR_URL")
+                                    ANNOUNCE_OK=0
+                                    WAKE_OK=0
+                                    _announce_to_maintainer "$ESC_MSG" && ANNOUNCE_OK=1
+                                    _wake_main_session       "$ESC_MSG" && WAKE_OK=1
+                                    if [ "$ANNOUNCE_OK" -eq 1 ] && [ "$WAKE_OK" -eq 1 ]; then
+                                        jq --arg sha_key "$SHA_KEY" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                                            '.escalated_conflicts[$sha_key] = $ts' \
+                                            "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+                                        echo "$LOG_PREFIX     🚨 Escalated stale rebase for $PR_KEY (announce + wake)"
+                                    else
+                                        echo "$LOG_PREFIX     ⚠️ Stale-rebase escalation partial (announce=$ANNOUNCE_OK wake=$WAKE_OK); will retry next tick" >&2
+                                    fi
+                                fi
+                            else
+                                echo "$LOG_PREFIX     🔧 Rebase agent already spawned for this SHA at $ALREADY_SPAWNED (within ${STALE_REBASE_MINUTES}m grace)"
+                            fi
                         else
                             REBASE_ENVELOPE=$(jq -n \
                                 --arg pk "$PR_KEY" --arg repo "$REPO" \
