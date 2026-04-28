@@ -103,7 +103,7 @@ _iso_minutes_ago() {
 [ -f "$STATE_FILE" ] || echo '{}' > "$STATE_FILE"
 # Ensure top-level keys. notified_reviews / notified_ci are keyed by
 # "<repo>#<num>@<sha>" so a new commit cleanly resets them.
-for KEY in notified_main_prs merged_prs created_dev_main_prs first_seen_unresolved notified_reviews notified_ci spawned_reviews review_rounds spawned_conflict_resolutions escalated_conflicts; do
+for KEY in notified_main_prs merged_prs created_dev_main_prs first_seen_unresolved notified_reviews notified_ci spawned_reviews review_rounds spawned_conflict_resolutions escalated_conflicts spawned_adversarial adversarial_rounds; do
     if ! jq -e ".$KEY" "$STATE_FILE" >/dev/null 2>&1; then
         jq ". + {\"$KEY\":{}}" "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
     fi
@@ -502,6 +502,101 @@ $REV_ENVELOPE
                     # (reviewer approved) or non-critical paths or spawn
                     # failed. Auto-merge is gated on the integration→main
                     # interlock below.
+
+                    # ─── Adversarial review gate ────────────────────────
+                    # After swarm-review approves a critical-path SHA, run
+                    # an independent adversarial pass before merge: codex
+                    # review primary, Claude-driven adversarial fallback if
+                    # codex isn't installed or fails. The agent is
+                    # responsible for choosing the tool — pr-manager just
+                    # spawns it. Same one-shot-per-SHA pattern as
+                    # swarm-review; round cap (default 2) prevents
+                    # infinite back-and-forth.
+                    #
+                    # Scope: only fires when ALREADY_REVIEWED_SHA is set,
+                    # which is itself gated on CRITICAL_HITS > 0 (webapp/
+                    # or prisma/ touched). Non-critical PRs fall through
+                    # to the merge with no adversarial pass.
+                    if [ -n "$ALREADY_REVIEWED_SHA" ]; then
+                        ADVERSARIAL_MAX_ROUNDS="${CLAWDBOT_ADVERSARIAL_MAX_ROUNDS:-2}"
+                        ALREADY_ADV_SHA=$(jq -r ".spawned_adversarial[\"$SHA_KEY\"] // \"\"" "$STATE_FILE")
+                        ADV_ROUNDS_USED=$(jq -r ".adversarial_rounds[\"$PR_KEY\"] // 0" "$STATE_FILE")
+
+                        if [ -z "$ALREADY_ADV_SHA" ]; then
+                            if [ "$ADV_ROUNDS_USED" -ge "$ADVERSARIAL_MAX_ROUNDS" ]; then
+                                ADV_CAP_MSG=$(printf '⚠️ PR %s: adversarial review hit %s-round cap without converging. Fresh SHA %s ready for your eyeball. %s' \
+                                    "$PR_KEY" "$ADVERSARIAL_MAX_ROUNDS" "${COMMIT_SHA:0:7}" "$PR_URL")
+                                _announce_to_maintainer "$ADV_CAP_MSG" || true
+                                echo "$LOG_PREFIX     🚨 Adversarial round cap ($ADVERSARIAL_MAX_ROUNDS) hit — escalated, not auto-merging"
+                                jq --arg sha_key "$SHA_KEY" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                                    '.spawned_adversarial[$sha_key] = $ts' \
+                                    "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+                                continue
+                            fi
+
+                            ADV_NEW_ROUND=$((ADV_ROUNDS_USED + 1))
+                            echo "$LOG_PREFIX     🎯 Spawning adversarial review (round $ADV_NEW_ROUND/$ADVERSARIAL_MAX_ROUNDS) for $PR_KEY"
+
+                            ADV_ENVELOPE=$(jq -n \
+                                --arg pk "$PR_KEY" --arg repo "$REPO" \
+                                --argjson num "$PR_NUM" --arg url "$PR_URL" \
+                                --arg sha "$COMMIT_SHA" --arg head "$PR_HEAD" \
+                                --arg base "$PR_BASE" --argjson round "$ADV_NEW_ROUND" \
+                                --argjson cap "$ADVERSARIAL_MAX_ROUNDS" \
+                                '{event:"adversarial_review", pr_key:$pk, repo:$repo, number:$num, url:$url, head_sha:$sha, head:$head, base:$base, round:$round, max_rounds:$cap}')
+
+                            ADV_TEXT="🎯 Adversarial PR review: $PR_KEY (round $ADV_NEW_ROUND/$ADVERSARIAL_MAX_ROUNDS) — fresh SHA ${COMMIT_SHA:0:7} on $PR_HEAD → $PR_BASE. Try to BREAK this code, exit.
+
+INSTRUCTIONS
+
+1. Set up a fresh worktree off origin/$PR_HEAD: \`cd ~/Canopy && git fetch origin $PR_HEAD && git worktree add /tmp/adv-review-$PR_NUM origin/$PR_HEAD\`. Work inside the worktree.
+
+2. **Try codex first.** If \`command -v codex\` returns a path, run:
+   \`\`\`
+   codex review --base $PR_BASE -c model=\"gpt-5.4\"
+   \`\`\`
+   with a 10-minute timeout (\`timeout 600 codex review ...\`). If codex produces a structured review with \`[P1]\`/\`[P2]\`/\`[P3]\` severity tags AND exit code 0, parse it and post BLOCK comments per [P1] and WARN per [P2] via \`gh api repos/$REPO/pulls/$PR_NUM/comments\` (one call per finding).
+
+3. **Fall back to Claude adversarial review** if codex isn't installed, errors, times out, or produces no parseable findings. Read the diff via \`gh pr diff $PR_NUM --repo $REPO\` and the file list via \`gh pr view $PR_NUM --repo $REPO --json files\`. Look specifically for what would BREAK in production:
+   - Regressions: would this change other call sites that rely on prior behaviour?
+   - Edge cases: nulls, empty collections, concurrent writes, partial failures, retries.
+   - Hidden assumptions: implicit ordering, time zones, encoding, units.
+   - Schema integrity: cross-table invariants, FK directions, immutability, cascade semantics, leaked secrets in audit payloads.
+   - Security: auth bypasses, injection surfaces, secret material in logs/payloads, missing CSRF/CORS guards.
+   - CI safety: anything that'll fail the seed/build step on develop or main.
+
+4. Severity tags: BLOCK / WARN / NIT. Only BLOCK creates unresolved review threads that gate merge — pick BLOCK only when you're confident the code is wrong, not when you'd just prefer it differently. WARN is for "this is worth noting but I can defend the current shape." NIT is style.
+
+5. Use \`\`\`suggestion\`\`\` blocks in BLOCK comments when the fix is mechanical and ≤10 lines.
+
+6. Finalize with \`gh pr review $PR_NUM --repo $REPO\` — \`--request-changes\` if any BLOCK posted, \`--approve\` if zero BLOCK and zero WARN, \`--comment\` if WARN-only.
+
+7. Emit ZERO intermediate assistant text. Produce exactly ONE final summary message at the end with format:
+   \`\`\`
+   🎯 \$short_repo#\$num: <X> BLOCK / <Y> WARN / <Z> NIT (tool=<codex|claude>)
+   <url>
+   \`\`\`
+
+8. Clean up: \`cd ~/Canopy && git worktree remove /tmp/adv-review-$PR_NUM --force\`.
+
+Round awareness: this is round $ADV_NEW_ROUND. If >1, check existing review threads from prior rounds (yours and swarm-review's) and DO NOT re-post findings that were already addressed.
+
+Envelope:
+\`\`\`json
+$ADV_ENVELOPE
+\`\`\`"
+
+                            if _spawn_handler_subagent "adversarial_review" "$PR_KEY" "$ADV_TEXT"; then
+                                jq --arg sha_key "$SHA_KEY" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                                   --arg pr_key "$PR_KEY" --argjson round "$ADV_NEW_ROUND" \
+                                    '.spawned_adversarial[$sha_key] = $ts | .adversarial_rounds[$pr_key] = $round' \
+                                    "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+                                echo "$LOG_PREFIX     ⏸️ Deferring auto-merge this tick; adversarial reviewer will post findings"
+                                continue
+                            fi
+                            echo "$LOG_PREFIX     ⚠️ Adversarial reviewer spawn failed; proceeding with ungated auto-merge this tick" >&2
+                        fi
+                    fi
 
                     HAS_OPEN_DEV_MAIN=$(echo "$PR_DATA" | jq --arg integration "$INTEGRATION_BRANCH" --arg main "$MAIN_BRANCH" '[.data.repository.pullRequests.nodes[] | select(.baseRefName == $main and .headRefName == $integration)] | length')
                     if [ "$HAS_OPEN_DEV_MAIN" -gt 0 ]; then
